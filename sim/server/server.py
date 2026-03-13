@@ -32,7 +32,8 @@ try:
     if os.name == 'nt':
         # On Windows, python 3.8+ needs add_dll_directory to find DLLs in the current folder.
         # opuslib also relies on PATH being set.
-        current_dir = os.path.dirname(os.path.abspath(__file__))
+        # The script may be run from another directory (e.g., sim/venv), so we need the ABSOLUTE path of where server.py actually is.
+        current_dir = os.path.dirname(os.path.realpath(__file__))
         os.environ['PATH'] = current_dir + os.pathsep + os.environ.get('PATH', '')
         if hasattr(os, 'add_dll_directory'):
             os.add_dll_directory(current_dir)
