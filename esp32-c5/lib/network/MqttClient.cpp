@@ -63,31 +63,26 @@ void MqttClient::start()
     }
 
     esp_mqtt_client_config_t cfg = {};
-    cfg.uri = uri_.c_str();
-    cfg.client_id = client_id_.empty() ? nullptr : client_id_.c_str();
-    
-    // -------------------------------
-    // MQTT Authentication (MEO tx_key)
-    // -------------------------------
-    cfg.username = username_.empty() ? nullptr : username_.c_str();
-    cfg.password = password_.empty() ? nullptr : password_.c_str();
 
-    // -------------------------------
-    // Memory-conscious configuration
-    // -------------------------------
-    cfg.buffer_size = 4096;      // Reduced from 8KB
-    cfg.out_buffer_size = 512;
-    cfg.keepalive = 60;
-    cfg.disable_auto_reconnect = false;
-    cfg.reconnect_timeout_ms = 2000;
+    // Broker
+    cfg.broker.address.uri = uri_.c_str();
 
-    // -------------------------------
-    // LWT (optional but useful)
-    // -------------------------------
-    cfg.lwt_topic = nullptr; // set later if needed
-    cfg.lwt_msg = nullptr;
-    cfg.lwt_qos = 0;
-    cfg.lwt_retain = 0;
+    // Credentials
+    cfg.credentials.client_id = client_id_.empty() ? nullptr : client_id_.c_str();
+    cfg.credentials.username = username_.empty() ? nullptr : username_.c_str();
+    cfg.credentials.authentication.password = password_.empty() ? nullptr : password_.c_str();
+
+    // Session
+    cfg.session.keepalive = 60;
+    cfg.session.disable_keepalive = false;
+
+    // Network
+    cfg.network.disable_auto_reconnect = false;
+    cfg.network.reconnect_timeout_ms = 2000;
+
+    // Buffer
+    cfg.buffer.size = 4096;
+    cfg.buffer.out_size = 512;
 
     ESP_LOGI(TAG, "Free heap before mqtt_start: %u", esp_get_free_heap_size());
 
