@@ -9,12 +9,17 @@
 
 namespace PinConfig {
 
-// --- I2S Audio (Full-duplex, shared clock) ---
-// Mic (ICS43434) and Speaker (MAX98357) share BCLK/WS
-static constexpr int I2S_BCLK  = 2;   // Shared bit clock
-static constexpr int I2S_WS    = 3;   // Shared word select (LRCLK)
-static constexpr int I2S_DIN   = 4;   // Mic data in  (ICS43434 SD)
-static constexpr int I2S_DOUT  = 5;   // Speaker data out (MAX98357 DIN)
+// --- I2S Audio ---
+// ESP32-C5 chỉ có 1 I2S port → full-duplex bắt buộc shared BCLK/WS
+// Mic (ICS43434)
+static constexpr int MIC_BCLK  = 2;   // ICS43434 SCK  (shared with SPK)
+static constexpr int MIC_WS    = 3;   // ICS43434 WS   (shared with SPK)
+static constexpr int MIC_DOUT  = 4;   // ICS43434 SD   (mic data out → C5 data in)
+
+// Speaker (MAX98357)
+static constexpr int SPK_BCLK  = 2;   // MAX98357 BCLK (shared with MIC)
+static constexpr int SPK_WS    = 3;   // MAX98357 LRC  (shared with MIC)
+static constexpr int SPK_DIN   = 5;   // MAX98357 DIN  (C5 data out → speaker)
 
 // --- UART (Communication with ESP32-S3) ---
 static constexpr int UART_TX   = 6;   // C5 TX -> S3 RX
