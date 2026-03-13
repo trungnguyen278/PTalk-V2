@@ -2,10 +2,9 @@
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Collect all .cpp sources
+# Collect src .cpp sources only (lib/ is handled by PlatformIO separately)
 file(GLOB_RECURSE app_sources
     ${CMAKE_SOURCE_DIR}/src/*.cpp
-    ${CMAKE_SOURCE_DIR}/lib/**/*.cpp
 )
 
 idf_component_register(
@@ -27,4 +26,5 @@ idf_component_register(
         esp_websocket_client
         mqtt
         json
+        bt
 )
