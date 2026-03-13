@@ -5,6 +5,7 @@
 #include "system/AudioManager.hpp"
 #include "system/NetworkManager.hpp"
 #include "system/UartBridge.hpp"
+#include "system/BluetoothService.hpp"
 #include "system/StateManager.hpp"
 #include "system/StateTypes.hpp"
 
@@ -21,6 +22,7 @@
 // Pin config
 #include "config/PinConfig.hpp"
 
+#include "WifiService.hpp"
 #include "driver/i2s_std.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -177,7 +179,91 @@ bool DeviceProfile::setup(AppController& app)
     }
 
     // =========================================================
-    // 3. NETWORK (WiFi + WebSocket + MQTT)
+    // 3. BLE PROVISIONING (if no WiFi credentials in NVS)
+    // =========================================================
+    if (user.wifi_ssid.empty()) {
+        ESP_LOGI(TAG, "No WiFi credentials found - starting BLE provisioning");
+
+        // Init WiFi stack briefly to scan networks for BLE listing
+        WifiService wifi_scan;
+        wifi_scan.init();
+        wifi_scan.ensureStaStarted();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        auto networks = wifi_scan.scanNetworks();
+        wifi_scan.disconnect();
+        ESP_LOGI(TAG, "Scanned %d WiFi networks for BLE listing", (int)networks.size());
+
+        // Prepare current config for BLE restore
+        BluetoothService::ConfigData ble_cfg;
+        ble_cfg.device_name = user.device_name;
+        ble_cfg.volume = user.volume;
+        ble_cfg.ws_url = user.ws_url;
+        ble_cfg.mqtt_url = user.mqtt_url;
+        ble_cfg.mqtt_user = user.user_id;
+        ble_cfg.mqtt_pass = user.tx_key;
+
+        static BluetoothService ble;
+        if (!ble.init("PTalk", networks, &ble_cfg)) {
+            ESP_LOGE(TAG, "BLE init failed");
+            return false;
+        }
+
+        // Block until config is received via BLE
+        static volatile bool ble_config_received = false;
+        static BluetoothService::ConfigData received_cfg;
+
+        ble.onConfigComplete([](const BluetoothService::ConfigData& cfg) {
+            received_cfg = cfg;
+            ble_config_received = true;
+            ESP_LOGI(TAG, "BLE config received: ssid='%s'", cfg.ssid.c_str());
+        });
+
+        ble.start();
+        ESP_LOGI(TAG, "Waiting for BLE provisioning...");
+
+        while (!ble_config_received) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        ble.stop();
+
+        // Save all received config to NVS
+        nvs_handle_t h;
+        if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
+            if (!received_cfg.ssid.empty())
+                nvs_set_str(h, "ssid", received_cfg.ssid.c_str());
+            if (!received_cfg.pass.empty())
+                nvs_set_str(h, "pass", received_cfg.pass.c_str());
+            if (!received_cfg.ws_url.empty())
+                nvs_set_str(h, "ws_url", received_cfg.ws_url.c_str());
+            if (!received_cfg.mqtt_url.empty())
+                nvs_set_str(h, "mqtt_url", received_cfg.mqtt_url.c_str());
+            if (!received_cfg.mqtt_user.empty())
+                nvs_set_str(h, "user_id", received_cfg.mqtt_user.c_str());
+            if (!received_cfg.mqtt_pass.empty())
+                nvs_set_str(h, "tx_key", received_cfg.mqtt_pass.c_str());
+            if (!received_cfg.device_name.empty())
+                nvs_set_str(h, "device_name", received_cfg.device_name.c_str());
+            nvs_set_u8(h, "volume", received_cfg.volume);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+
+        // Update user settings with received values
+        user.wifi_ssid = received_cfg.ssid;
+        user.wifi_pass = received_cfg.pass;
+        if (!received_cfg.ws_url.empty()) user.ws_url = received_cfg.ws_url;
+        if (!received_cfg.mqtt_url.empty()) user.mqtt_url = received_cfg.mqtt_url;
+        if (!received_cfg.mqtt_user.empty()) user.user_id = received_cfg.mqtt_user;
+        if (!received_cfg.mqtt_pass.empty()) user.tx_key = received_cfg.mqtt_pass;
+        user.device_name = received_cfg.device_name;
+        user.volume = received_cfg.volume;
+
+        ESP_LOGI(TAG, "BLE provisioning complete, continuing with WiFi connect");
+    }
+
+    // =========================================================
+    // 4. NETWORK (WiFi + WebSocket + MQTT)
     // =========================================================
     auto network_mgr = std::make_unique<NetworkManager>();
 
@@ -254,7 +340,7 @@ bool DeviceProfile::setup(AppController& app)
     });
 
     // =========================================================
-    // 4. TOUCH INPUT (Button)
+    // 5. TOUCH INPUT (Button)
     // =========================================================
     auto touch_input = std::make_unique<TouchInput>();
     TouchInput::Config touch_cfg{
@@ -274,7 +360,7 @@ bool DeviceProfile::setup(AppController& app)
     });
 
     // =========================================================
-    // 5. UART BRIDGE (Communication with S3)
+    // 6. UART BRIDGE (Communication with S3)
     // =========================================================
     auto uart_bridge = std::make_unique<UartBridge>();
     UartBridge::Config uart_cfg{
@@ -340,7 +426,7 @@ bool DeviceProfile::setup(AppController& app)
     });
 
     // =========================================================
-    // 6. ATTACH MODULES -> APP CONTROLLER
+    // 7. ATTACH MODULES -> APP CONTROLLER
     // =========================================================
     app.attachModules(
         std::move(audio_mgr),
