@@ -12,7 +12,7 @@ UartBridge::~UartBridge()
 bool UartBridge::init(const Config& cfg)
 {
     cfg_ = cfg;
-    uart_port_ = cfg_.uart_num;
+    uart_port_ = (uart_port_t)cfg_.uart_num;
 
     uart_config_t uart_cfg = {};
     uart_cfg.baud_rate  = cfg_.baud_rate;

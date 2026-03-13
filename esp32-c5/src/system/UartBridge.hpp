@@ -55,7 +55,7 @@ private:
     bool sendFrame(uint8_t type, const uint8_t* payload, uint16_t len);
 
     Config cfg_{};
-    int uart_port_ = -1;
+    uart_port_t uart_port_ = (uart_port_t)-1;
     std::atomic<bool> started_{false};
     TaskHandle_t rx_task_ = nullptr;
 

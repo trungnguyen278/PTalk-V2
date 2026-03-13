@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 
 // =============================================================================
 // UART Protocol between ESP32-C5 and ESP32-S3
