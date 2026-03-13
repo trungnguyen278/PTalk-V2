@@ -1,5 +1,6 @@
 #include "I2SAudioInput_ICS43434.hpp"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include <cstring>
 
 static const char* TAG = "ICS43434";
@@ -71,9 +72,9 @@ bool I2SAudioInput_ICS43434::startCapture()
     return true;
 }
 
-bool I2SAudioInput_ICS43434::stopCapture()
+void I2SAudioInput_ICS43434::stopCapture()
 {
-    if (!capturing_) return true;
+    if (!capturing_) return;
 
     esp_err_t err = i2s_channel_disable(rx_chan_);
     if (err != ESP_OK) {
@@ -82,12 +83,11 @@ bool I2SAudioInput_ICS43434::stopCapture()
 
     capturing_ = false;
     ESP_LOGI(TAG, "Capture stopped");
-    return true;
 }
 
-bool I2SAudioInput_ICS43434::pauseCapture()
+void I2SAudioInput_ICS43434::pauseCapture()
 {
-    return stopCapture();
+    stopCapture();
 }
 
 size_t I2SAudioInput_ICS43434::readPcm(int16_t* buffer, size_t max_samples)

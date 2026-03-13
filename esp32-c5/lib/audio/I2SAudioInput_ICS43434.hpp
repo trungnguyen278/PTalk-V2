@@ -20,11 +20,15 @@ public:
 
     bool   init() override;
     bool   startCapture() override;
-    bool   stopCapture() override;
-    bool   pauseCapture() override;
+    void   stopCapture() override;
+    void   pauseCapture() override;
     size_t readPcm(int16_t* buffer, size_t max_samples) override;
     void   setMuted(bool muted) override;
     void   setLowPower(bool enable) override;
+
+    uint32_t sampleRate() const override { return cfg_.sample_rate; }
+    uint8_t  channels() const override { return 1; }
+    uint8_t  bitsPerSample() const override { return 16; }
 
 private:
     i2s_chan_handle_t rx_chan_;
