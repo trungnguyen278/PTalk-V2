@@ -23,6 +23,10 @@ bool NetworkManager::init(const Config& cfg)
     ws_   = std::make_unique<WebSocketClient>();
     mqtt_ = std::make_unique<MqttClient>();
 
+    wifi_->init();
+    ws_->init();
+    mqtt_->init();
+
     setupWifi();
     setupWebSocket();
     setupMqtt();
@@ -35,11 +39,12 @@ void NetworkManager::start()
     if (started_) return;
     started_ = true;
 
-    // Start WiFi connection
+    // If we have credentials, connect directly; otherwise autoConnect loads from NVS
     if (!cfg_.wifi_ssid.empty()) {
-        wifi_->setCredentials(cfg_.wifi_ssid, cfg_.wifi_pass);
+        wifi_->connectWithCredentials(cfg_.wifi_ssid.c_str(), cfg_.wifi_pass.c_str());
+    } else {
+        wifi_->autoConnect();
     }
-    wifi_->startSTA();
 
     ESP_LOGI(TAG, "NetworkManager started");
 }
@@ -49,8 +54,8 @@ void NetworkManager::stop()
     if (!started_) return;
     started_ = false;
 
-    if (ws_) ws_->disconnect();
-    if (mqtt_) mqtt_->disconnect();
+    if (ws_) ws_->close();
+    if (mqtt_) mqtt_->stop();
 
     vTaskDelay(pdMS_TO_TICKS(200));
     uplink_task_ = nullptr;
@@ -62,7 +67,7 @@ void NetworkManager::setCredentials(const std::string& ssid, const std::string& 
 {
     cfg_.wifi_ssid = ssid;
     cfg_.wifi_pass = pass;
-    if (wifi_) wifi_->setCredentials(ssid, pass);
+    if (wifi_) wifi_->connectWithCredentials(ssid.c_str(), pass.c_str());
 }
 
 void NetworkManager::setMicBuffer(StreamBufferHandle_t mic_buf) { mic_buf_ = mic_buf; }
@@ -72,29 +77,29 @@ void NetworkManager::setAudioManager(AudioManager* mgr) { audio_mgr_ = mgr; }
 
 void NetworkManager::setupWifi()
 {
-    wifi_->onStatusChanged([this](WifiService::Status status) {
+    wifi_->onStatus([this](int status) {
         switch (status) {
-        case WifiService::Status::CONNECTED:
+        case 2: // GOT_IP
             ESP_LOGI(TAG, "WiFi connected");
             StateManager::instance().setConnectivityState(state::ConnectivityState::WIFI_CONNECTED);
 
             // Connect WebSocket
             if (ws_ && !cfg_.ws_url.empty()) {
                 StateManager::instance().setConnectivityState(state::ConnectivityState::CONNECTING_WS);
-                ws_->connect(cfg_.ws_url);
+                ws_->setUrl(cfg_.ws_url);
+                ws_->connect();
             }
 
             // Connect MQTT
             if (mqtt_ && !cfg_.mqtt_url.empty()) {
-                MqttClient::Config mqtt_cfg;
-                mqtt_cfg.uri = cfg_.mqtt_url;
-                mqtt_cfg.username = cfg_.user_id.empty() ? std::string(getDeviceEfuseID()) : cfg_.user_id;
-                mqtt_cfg.password = cfg_.tx_key;
-                mqtt_->connect(mqtt_cfg);
+                mqtt_->setUri(cfg_.mqtt_url);
+                std::string user = cfg_.user_id.empty() ? std::string(getDeviceEfuseID()) : cfg_.user_id;
+                mqtt_->setCredentials(user, cfg_.tx_key);
+                mqtt_->start();
             }
             break;
 
-        case WifiService::Status::DISCONNECTED:
+        case 0: // DISCONNECTED
             ESP_LOGW(TAG, "WiFi disconnected");
             if (!ws_immune_) {
                 StateManager::instance().setConnectivityState(state::ConnectivityState::OFFLINE);
@@ -102,7 +107,7 @@ void NetworkManager::setupWifi()
             }
             break;
 
-        case WifiService::Status::CONNECTING:
+        case 1: // CONNECTING
             StateManager::instance().setConnectivityState(state::ConnectivityState::CONNECTING_WIFI);
             break;
         }
@@ -113,9 +118,9 @@ void NetworkManager::setupWifi()
 
 void NetworkManager::setupWebSocket()
 {
-    ws_->onStatusChanged([this](WebSocketClient::Status status) {
+    ws_->onStatus([this](int status) {
         switch (status) {
-        case WebSocketClient::Status::CONNECTED:
+        case 2: // OPEN
             ESP_LOGI(TAG, "WebSocket connected");
             ws_connected_ = true;
             StateManager::instance().setConnectivityState(state::ConnectivityState::ONLINE);
@@ -128,7 +133,7 @@ void NetworkManager::setupWebSocket()
             }
             break;
 
-        case WebSocketClient::Status::DISCONNECTED:
+        case 0: // CLOSED
             ESP_LOGW(TAG, "WebSocket disconnected");
             ws_connected_ = false;
             if (!ws_immune_) {
@@ -137,12 +142,12 @@ void NetworkManager::setupWebSocket()
             if (disconnect_cb_) disconnect_cb_();
             break;
 
-        case WebSocketClient::Status::CONNECTING:
+        case 1: // CONNECTING
             break;
         }
     });
 
-    ws_->onTextMessage([this](const std::string& msg) {
+    ws_->onText([this](const std::string& msg) {
         ESP_LOGI(TAG, "WS text: %s", msg.c_str());
 
         // Check for emotion code prefix (2-digit code before command)
@@ -162,7 +167,7 @@ void NetworkManager::setupWebSocket()
         if (text_cb_) text_cb_(msg);
     });
 
-    ws_->onBinaryMessage([this](const uint8_t* data, size_t len) {
+    ws_->onBinary([this](const uint8_t* data, size_t len) {
         if (binary_cb_) binary_cb_(data, len);
     });
 }
