@@ -77,7 +77,7 @@ void PowerManager::timerCallback() {
 
     if (voltage < 0.0f || percent == BATTERY_INVALID) {
         battery_present = false;
-        publishIfChanged(state::PowerState::ERROR);
+        publishIfChanged(state::PowerState::NORMAL);
         return;
     }
 
@@ -122,7 +122,7 @@ state::PowerState PowerManager::evaluateState(float volt,
 {
     // FULL takes priority
     if (fullStatus == 1) {
-        return state::PowerState::FULL_BATTERY;
+        return state::PowerState::FULL;
     }
 
     // CHARGING takes next priority
