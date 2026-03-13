@@ -142,18 +142,18 @@ bool DeviceProfile::setup(AppController& app)
 
     // Mic: ICS43434 on RX channel
     I2SAudioInput_ICS43434::Config mic_cfg{
-        .pin_bclk    = (gpio_num_t)PinConfig::I2S_BCLK,
-        .pin_ws      = (gpio_num_t)PinConfig::I2S_WS,
-        .pin_din     = (gpio_num_t)PinConfig::I2S_DIN,
+        .pin_bclk    = (gpio_num_t)PinConfig::MIC_BCLK,
+        .pin_ws      = (gpio_num_t)PinConfig::MIC_WS,
+        .pin_din     = (gpio_num_t)PinConfig::MIC_DOUT,
         .sample_rate = 16000
     };
     auto mic = std::make_unique<I2SAudioInput_ICS43434>(rx_chan, mic_cfg);
 
     // Speaker: MAX98357 on TX channel
     I2SAudioOutput_MAX98357::Config spk_cfg{
-        .pin_bclk    = (gpio_num_t)PinConfig::I2S_BCLK,
-        .pin_ws      = (gpio_num_t)PinConfig::I2S_WS,
-        .pin_dout    = (gpio_num_t)PinConfig::I2S_DOUT,
+        .pin_bclk    = (gpio_num_t)PinConfig::SPK_BCLK,
+        .pin_ws      = (gpio_num_t)PinConfig::SPK_WS,
+        .pin_dout    = (gpio_num_t)PinConfig::SPK_DIN,
         .sample_rate = 16000
     };
     auto speaker = std::make_unique<I2SAudioOutput_MAX98357>(tx_chan, spk_cfg);
