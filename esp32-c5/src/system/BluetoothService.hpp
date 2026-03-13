@@ -5,17 +5,12 @@
 #include <vector>
 #include <cstdint>
 
-#include "esp_bt.h"
-#include "esp_gap_ble_api.h"
-#include "esp_gatts_api.h"
-#include "esp_bt_main.h"
-#include "esp_gatt_common_api.h"
 #include "Version.hpp"
 
 struct WifiInfo;
 
-// BLE GATT service for provisioning WiFi, WS, MQTT credentials.
-// Ported from V1 PTalk for ESP32-C5 (BLE 5.0 LE).
+// BLE GATT provisioning service using NimBLE stack.
+// ESP32-C5 BLE 5.0 LE - compatible with PTalk V1 mobile app.
 class BluetoothService
 {
 public:
@@ -44,6 +39,7 @@ public:
 
     void onConfigComplete(OnConfigComplete cb) { config_cb_ = cb; }
 
+    // Same UUIDs as V1 for mobile app compatibility
     static constexpr uint16_t SVC_UUID_CONFIG = 0xFF01;
     static constexpr uint16_t CHR_UUID_DEVICE_NAME = 0xFF02;
     static constexpr uint16_t CHR_UUID_VOLUME = 0xFF03;
@@ -60,33 +56,19 @@ public:
     static constexpr uint16_t CHR_UUID_MQTT_USER = 0xFF0E;
     static constexpr uint16_t CHR_UUID_MQTT_PASS = 0xFF0F;
 
-private:
+    // NimBLE callbacks need access to instance
     static BluetoothService *s_instance;
 
-    static void gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
-    static void gattsEventHandler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+    ConfigData temp_cfg_;
+    OnConfigComplete config_cb_ = nullptr;
+    bool url_unlocked_ = false;
+    static constexpr const char *WS_URL_AUTH_TOKEN = "PTALK_OK";
 
-    void handleWrite(esp_ble_gatts_cb_param_t *param);
-    void handleRead(esp_ble_gatts_cb_param_t *param, esp_gatt_if_t gatts_if);
+    std::string device_id_str_;
+    std::vector<WifiInfo> wifi_networks_;
+    size_t wifi_read_index_ = 0;
 
 private:
     std::string adv_name_;
     bool started_ = false;
-    esp_gatt_if_t gatts_if_ = 0;
-    uint16_t conn_id_ = 0xFFFF;
-    uint16_t service_handle_ = 0;
-    uint16_t char_handles[14] = {0};
-
-    ConfigData temp_cfg_;
-    OnConfigComplete config_cb_ = nullptr;
-
-    bool url_unlocked_ = false;
-    static constexpr const char *WS_URL_AUTH_TOKEN = "PTALK_OK";
-
-    std::string wifi_list_json_;
-    std::string device_id_str_;
-    std::vector<WifiInfo> wifi_networks_;
-    size_t wifi_read_index_ = 0;
-    uint16_t mtu_size_ = 23;
-    esp_ble_adv_params_t adv_params_;
 };
