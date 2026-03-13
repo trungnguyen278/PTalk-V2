@@ -1,5 +1,6 @@
 #include "I2SAudioOutput_MAX98357.hpp"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include <cstring>
 
 static const char* TAG = "MAX98357";
