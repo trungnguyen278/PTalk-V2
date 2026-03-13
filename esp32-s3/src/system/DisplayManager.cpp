@@ -356,15 +356,8 @@ void DisplayManager::handleConnectivity(state::ConnectivityState s)
         playText("Connecting WiFi...", -1, -1, 0xFFFF, 1.8); // centered, white text
         break;
 
-    case state::ConnectivityState::WIFI_PORTAL:
-        // Show text "WiFi Portal Mode"
-        playText("WiFi Portal Mode", -1, -1, 0xFFFF, 1.8); // centered, white text
-        // playEmotion("sad");
-        break;
-    case state::ConnectivityState::CONFIG_BLE:
-        // Show text "BLE Config Mode"
-        playText("BLE Config Mode", -1, -1, 0xFFFF, 1.8); // centered, white text
-        // playEmotion("sad");
+    case state::ConnectivityState::WIFI_CONNECTED:
+        playText("WiFi Connected", -1, -1, 0xFFFF, 1.8);
         break;
 
     case state::ConnectivityState::CONNECTING_WS:
@@ -398,14 +391,6 @@ void DisplayManager::handleSystem(state::SystemState s)
     case state::SystemState::MAINTENANCE:
         playEmotion("maintenance");
         break;
-
-    case state::SystemState::UPDATING_FIRMWARE:
-        playText("Updating Firmware...", -1, -1, 0xFFFF, 1.8); // centered, white text
-        break;
-
-    case state::SystemState::FACTORY_RESETTING:
-        playEmotion("reset");
-        break;
     }
 }
 
@@ -425,7 +410,7 @@ void DisplayManager::handlePower(state::PowerState s)
         playIcon("battery_charge", IconPlacement::Custom, width_ - 185, 0);
         break;
 
-    case state::PowerState::FULL_BATTERY:
+    case state::PowerState::FULL:
         playIcon("battery_full", IconPlacement::Custom, width_ - 185, 0);
         break;
 
@@ -440,8 +425,7 @@ void DisplayManager::handlePower(state::PowerState s)
         // ✅ Removed blocking delay - icon stays visible via display loop
         break;
 
-    case state::PowerState::ERROR:
-        playEmotion("error");
+    default:
         break;
     }
 }
