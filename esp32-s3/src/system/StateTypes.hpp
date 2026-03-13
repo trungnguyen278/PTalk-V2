@@ -33,8 +33,7 @@ namespace state
         BOOTING,
         RUNNING,
         ERROR,
-        MAINTENANCE,
-        CONFIG_BLE    // BLE provisioning active
+        MAINTENANCE
     };
 
     // ---------- Power (S3 manages battery) ----------
