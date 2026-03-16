@@ -22,19 +22,15 @@ bool I2SAudioInput_ICS43434::init()
     // Configure RX channel in standard I2S (Philips) mode
     i2s_std_config_t std_cfg = {};
 
-    // Clock config
-    std_cfg.clk_cfg.sample_rate_hz = cfg_.sample_rate;
-    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
-    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    // ESP32-C5 I2S runs ~6.8% faster than configured rate.
+    // Match TX compensation so RX DMA buffer sizing is consistent.
+    uint32_t compensated_rate = cfg_.sample_rate * 1000 / 1068;
+    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(compensated_rate);
 
-    // Slot config: ICS43434 outputs 24-bit data in 32-bit frames
-    std_cfg.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_32BIT;
-    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
-    std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT; // ICS43434 L/R pin determines channel
-    std_cfg.slot_cfg.ws_width = 32;
-    std_cfg.slot_cfg.ws_pol = false;
-    std_cfg.slot_cfg.bit_shift = true; // I2S Philips standard
+    // Philips standard slot config, override to MONO left-only for ICS43434
+    std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
 
     // GPIO config
     std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
@@ -46,6 +42,7 @@ bool I2SAudioInput_ICS43434::init()
     std_cfg.gpio_cfg.invert_flags.bclk_inv = false;
     std_cfg.gpio_cfg.invert_flags.ws_inv = false;
 
+    ESP_LOGI(TAG, "Init RX: bclk=%d, ws=%d, din=%d", (int)cfg_.pin_bclk, (int)cfg_.pin_ws, (int)cfg_.pin_din);
     esp_err_t err = i2s_channel_init_std_mode(rx_chan_, &std_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init RX std mode: %s", esp_err_to_name(err));
@@ -94,16 +91,25 @@ size_t I2SAudioInput_ICS43434::readPcm(int16_t* buffer, size_t max_samples)
 {
     if (!capturing_ || muted_ || !buffer || max_samples == 0) return 0;
 
-    // Read 32-bit samples from I2S
-    const size_t read_bytes = max_samples * sizeof(int32_t);
-    int32_t raw_buf[256]; // Max 256 samples per read
+    // Read 32-bit samples from I2S (static to avoid stack overflow)
+    static int32_t raw_buf[256];
     size_t actual_samples = (max_samples > 256) ? 256 : max_samples;
     size_t bytes_read = 0;
 
     esp_err_t err = i2s_channel_read(rx_chan_, raw_buf,
                                       actual_samples * sizeof(int32_t),
                                       &bytes_read, pdMS_TO_TICKS(100));
-    if (err != ESP_OK || bytes_read == 0) return 0;
+
+    static uint32_t diag_count = 0;
+    diag_count++;
+    if (diag_count <= 5 || diag_count % 200 == 0) {
+        ESP_LOGI(TAG, "readPcm[%lu]: err=%d, bytes_read=%zu, capturing=%d",
+                 (unsigned long)diag_count, (int)err, bytes_read, (int)capturing_);
+    }
+
+    // ESP_ERR_TIMEOUT (263) is normal when DMA has fewer bytes than requested.
+    // As long as we got data, use it.
+    if (bytes_read == 0) return 0;
 
     size_t samples = bytes_read / sizeof(int32_t);
 

@@ -18,6 +18,7 @@ public:
     I2SAudioOutput_MAX98357(i2s_chan_handle_t tx_chan, const Config& cfg);
     ~I2SAudioOutput_MAX98357() override;
 
+    bool   init();  // Init TX channel (call early for full-duplex clock)
     bool   startPlayback() override;
     void   stopPlayback() override;
     size_t writePcm(const int16_t* pcm, size_t pcm_samples) override;
