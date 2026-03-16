@@ -190,7 +190,9 @@ class OpusCodecWrapper:
 
     def __init__(self):
         if HAS_OPUS:
-            self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
+            self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_AUDIO)
+            self.encoder.bitrate = 48000  # 48kbps for music quality
+            self.encoder.complexity = 10  # Max quality (server has plenty of CPU)
             self.decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
         else:
             self.encoder = None
@@ -334,13 +336,13 @@ async def handle_device(websocket, args):
                         print(f"  [TEXT] -> PROCESSING")
                         await asyncio.sleep(0.5)
 
-                        # Prepare response audio
-                        if args.echo:
-                            response_frames = session.get_echo_data()
-                            source = "echo"
-                        elif wav_data:
+                        # Prepare response audio (WAV file takes priority)
+                        if wav_data:
                             response_frames = wav_data
                             source = f"wav({args.wav_file})"
+                        elif args.echo:
+                            response_frames = session.get_echo_data()
+                            source = "echo"
                         else:
                             response_frames = session.get_echo_data()
                             source = "echo(default)"
@@ -350,13 +352,23 @@ async def handle_device(websocket, args):
                             await websocket.send("SPEAKING")
                             print(f"  [TEXT] -> SPEAKING ({len(response_frames)} frames, {source})")
 
-                            # Stream audio back
-                            for frame in response_frames:
+                            # Stream audio in batches to reduce WS overhead
+                            # Batch 10 frames (~200ms audio) per WS message
+                            # Send at ~1.2x real-time to build buffer on device
+                            BATCH_SIZE = 10
+                            for i in range(0, len(response_frames), BATCH_SIZE):
+                                batch = response_frames[i:i + BATCH_SIZE]
+                                batch_data = b''.join(batch)
                                 try:
-                                    await websocket.send(frame)
+                                    await websocket.send(batch_data)
                                 except Exception:
                                     break
-                                await asyncio.sleep(0.01)  # ~10ms between frames
+                                # Sleep less than real-time: 200ms audio → 160ms sleep
+                                await asyncio.sleep(0.016 * len(batch))
+                                sent = i + len(batch)
+                                if sent % 100 < BATCH_SIZE:
+                                    print(f"  [STREAM] {sent}/{len(response_frames)} frames sent ({sent*0.02:.1f}s)", end='\r')
+                            print(f"  [STREAM] Done: {len(response_frames)} frames sent ({len(response_frames)*0.02:.1f}s)    ")
 
                         # Send IDLE
                         await websocket.send("IDLE")
@@ -364,9 +376,16 @@ async def handle_device(websocket, args):
                         session.state = 'IDLE'
 
             elif isinstance(message, bytes):
-                # Binary message (encoded audio)
+                # Binary message: may contain multiple length-prefixed Opus frames
                 if session.state == 'LISTENING':
-                    session.receive_audio(message)
+                    offset = 0
+                    while offset + 2 <= len(message):
+                        frame_len = struct.unpack('<H', message[offset:offset+2])[0]
+                        if frame_len == 0 or offset + 2 + frame_len > len(message):
+                            break
+                        frame_data = message[offset:offset + 2 + frame_len]
+                        session.receive_audio(frame_data)
+                        offset += 2 + frame_len
                     frame_count = len(session.recorded_frames)
                     if frame_count % 50 == 0:
                         print(f"  [AUDIO] Received {frame_count} frames...", end='\r')
@@ -381,21 +400,39 @@ async def handle_device(websocket, args):
 
 def load_wav_as_encoded(wav_path: str, codec_type: str) -> list:
     """Load a WAV file and encode it for streaming."""
-    import soundfile as sf
+    with wave.open(wav_path, 'r') as wf:
+        sr = wf.getframerate()
+        nch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
 
-    data, sr = sf.read(wav_path, dtype='int16')
+    # Convert to int16
+    if sw == 2:
+        data = np.frombuffer(raw, dtype=np.int16)
+    elif sw == 3:
+        # 24-bit: pad to 32-bit then shift
+        samples = len(raw) // 3
+        raw32 = bytearray(samples * 4)
+        for i in range(samples):
+            raw32[i*4+1:i*4+4] = raw[i*3:i*3+3]
+        data = np.frombuffer(bytes(raw32), dtype=np.int32).astype(np.float64)
+        data = (data / 2**16).astype(np.int16)
+    else:
+        data = np.frombuffer(raw, dtype=np.int16)
+
+    # Ensure mono
+    if nch > 1:
+        data = data.reshape(-1, nch)[:, 0]
+
+    # Resample if needed
     if sr != SAMPLE_RATE:
-        # Simple resampling
         ratio = SAMPLE_RATE / sr
         indices = np.arange(0, len(data), 1 / ratio).astype(int)
         indices = indices[indices < len(data)]
         data = data[indices]
 
-    # Ensure mono
-    if data.ndim > 1:
-        data = data[:, 0]
-
     data = data.astype(np.int16)
+    print(f"  [WAV] Loaded: {len(data)} samples, {len(data)/SAMPLE_RATE:.1f}s, resampled {sr}->{SAMPLE_RATE}Hz")
 
     # Encode in frames
     frames = []
@@ -443,8 +480,8 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PTalk V2 Test Server")
     parser.add_argument("--port", type=int, default=8000, help="WebSocket port (default: 8000)")
-    parser.add_argument("--codec", choices=["opus", "adpcm"], default="adpcm",
-                        help="Audio codec (default: adpcm)")
+    parser.add_argument("--codec", choices=["opus", "adpcm"], default="opus",
+                        help="Audio codec (default: opus)")
     parser.add_argument("--echo", action="store_true", default=True,
                         help="Echo recorded audio back (default: True)")
     parser.add_argument("--wav-file", type=str, default=None,
@@ -452,4 +489,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    # Auto-detect WAV file in server directory if not specified
+    if not args.wav_file:
+        import glob
+        wav_files = glob.glob("*.wav")
+        if wav_files:
+            args.wav_file = wav_files[0]
+            print(f"[AUTO] Found WAV file: {args.wav_file}")
+
     asyncio.run(main(args))
