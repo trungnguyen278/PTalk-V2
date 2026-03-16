@@ -185,7 +185,7 @@ void AppController::processQueue()
                         state::InteractionState::LISTENING, state::InputSource::BUTTON);
                     break;
                 case event::AppEvent::RELEASE_BUTTON:
-                    if (StateManager::instance().getConnectivityState() != state::ConnectivityState::ONLINE) break;
+                    // Always stop listening on release, even if connectivity dropped
                     StateManager::instance().setInteractionState(
                         state::InteractionState::IDLE, state::InputSource::BUTTON);
                     break;
