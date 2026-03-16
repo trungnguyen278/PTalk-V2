@@ -20,6 +20,8 @@ static constexpr int MIC_DOUT  = 4;   // ICS43434 SD   (mic data out → C5 data
 static constexpr int SPK_BCLK  = 2;   // MAX98357 BCLK (shared with MIC)
 static constexpr int SPK_WS    = 3;   // MAX98357 LRC  (shared with MIC)
 static constexpr int SPK_DIN   = 5;   // MAX98357 DIN  (C5 data out → speaker)
+static constexpr int SPK_SD    = 9;   // MAX98357 SD   (shutdown: LOW=off, HIGH=on)
+static constexpr int SPK_GAIN  = 10;  // MAX98357 GAIN (LOW=15dB, float=9dB, HIGH=12dB)
 
 // --- UART (Communication with ESP32-S3) ---
 static constexpr int UART_TX   = 6;   // C5 TX -> S3 RX

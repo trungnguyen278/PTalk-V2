@@ -24,9 +24,14 @@
 
 #include "WifiService.hpp"
 #include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_system.h"
 
 static const char* TAG = "DeviceProfile";
 
@@ -36,7 +41,7 @@ static const char* TAG = "DeviceProfile";
 namespace user_cfg {
     struct UserSettings {
         std::string device_name = "PTalk";
-        uint8_t  volume = 60;
+        uint8_t  volume = 30;
         std::string wifi_ssid;
         std::string wifi_pass;
         std::string ws_url;
@@ -106,7 +111,7 @@ static std::string normalize_mqtt_url(std::string val) {
 // =============================================================================
 bool DeviceProfile::setup(AppController& app)
 {
-    ESP_LOGI(TAG, "DeviceProfile setup begin (ESP32-C5)");
+    ESP_LOGI(TAG, "DeviceProfile setup begin (ESP32-C5), free heap: %lu", (unsigned long)esp_get_free_heap_size());
 
     // Init NVS
     esp_err_t nvs_err = nvs_flash_init();
@@ -119,15 +124,37 @@ bool DeviceProfile::setup(AppController& app)
     auto user = user_cfg::load();
 
     // =========================================================
-    // 1. I2S Full-Duplex Setup (shared BCLK/WS for mic+speaker)
+    // 1. MAX98357 control pins (SD=enable, GAIN)
+    // =========================================================
+    // SD pin: output HIGH to enable amplifier
+    gpio_config_t spk_sd_cfg = {};
+    spk_sd_cfg.pin_bit_mask = (1ULL << PinConfig::SPK_SD);
+    spk_sd_cfg.mode = GPIO_MODE_OUTPUT;
+    spk_sd_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    spk_sd_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&spk_sd_cfg);
+    gpio_set_level((gpio_num_t)PinConfig::SPK_SD, 1);
+
+    // GAIN pin: float (no pull) = 9dB gain (less clipping/buzzing risk)
+    // VDD=12dB, GND=15dB, float=9dB per MAX98357 datasheet
+    gpio_config_t spk_gain_cfg = {};
+    spk_gain_cfg.pin_bit_mask = (1ULL << PinConfig::SPK_GAIN);
+    spk_gain_cfg.mode = GPIO_MODE_INPUT;  // High-Z (floating)
+    spk_gain_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    spk_gain_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&spk_gain_cfg);
+    ESP_LOGI(TAG, "MAX98357 SD=HIGH (enabled), GAIN=float (9dB)");
+
+    // =========================================================
+    // 2. I2S Full-Duplex Setup (shared BCLK/WS for mic+speaker)
     // =========================================================
     i2s_chan_handle_t tx_chan = nullptr;
     i2s_chan_handle_t rx_chan = nullptr;
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(
         (i2s_port_t)PinConfig::I2S_NUM, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num  = 6;
-    chan_cfg.dma_frame_num = 256;
+    chan_cfg.dma_desc_num  = 4;
+    chan_cfg.dma_frame_num = 240;  // 15ms per desc × 4 = 60ms total DMA buffer
 
     esp_err_t err = i2s_new_channel(&chan_cfg, &tx_chan, &rx_chan);
     if (err != ESP_OK) {
@@ -157,10 +184,10 @@ bool DeviceProfile::setup(AppController& app)
         .sample_rate = 16000
     };
     auto speaker = std::make_unique<I2SAudioOutput_MAX98357>(tx_chan, spk_cfg);
+    speaker->init();  // Init TX std mode
     speaker->setVolume(user.volume);
 
     // Codec: Opus (primary) or ADPCM (fallback)
-    // To switch codec, change this line:
     #ifdef USE_ADPCM_CODEC
         auto codec = std::make_unique<AdpcmCodec>();
         ESP_LOGI(TAG, "Using ADPCM codec");
@@ -178,19 +205,49 @@ bool DeviceProfile::setup(AppController& app)
         return false;
     }
 
+    // Enable TX channel AFTER both TX and RX are initialized.
+    // In full-duplex I2S, both channels share the controller.
+    // Enabling TX before RX init can cause TX DMA to stop working.
+    i2s_channel_enable(tx_chan);
+    ESP_LOGI(TAG, "I2S TX enabled (clock source for full-duplex)");
+
+ESP_LOGI(TAG, "After AudioManager init, free heap: %lu", (unsigned long)esp_get_free_heap_size());
+
     // =========================================================
     // 3. BLE PROVISIONING (if no WiFi credentials in NVS)
     // =========================================================
     if (user.wifi_ssid.empty()) {
         ESP_LOGI(TAG, "No WiFi credentials found - starting BLE provisioning");
 
-        // Init WiFi stack briefly to scan networks for BLE listing
-        WifiService wifi_scan;
-        wifi_scan.init();
-        wifi_scan.ensureStaStarted();
+        // Scan WiFi networks using raw ESP-IDF APIs (avoid creating a WifiService
+        // that would conflict with the one NetworkManager creates later)
+        esp_netif_init();
+        esp_event_loop_create_default();
+        esp_netif_create_default_wifi_sta();
+        wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+        esp_wifi_init(&wifi_cfg);
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_start();
         vTaskDelay(pdMS_TO_TICKS(500));
-        auto networks = wifi_scan.scanNetworks();
-        wifi_scan.disconnect();
+
+        wifi_scan_config_t scan_cfg = {};
+        esp_wifi_scan_start(&scan_cfg, true);  // blocking scan
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+        std::vector<wifi_ap_record_t> ap_records(ap_count);
+        esp_wifi_scan_get_ap_records(&ap_count, ap_records.data());
+
+        std::vector<WifiInfo> networks;
+        for (int i = 0; i < ap_count; i++) {
+            WifiInfo info;
+            info.ssid = (const char*)ap_records[i].ssid;
+            info.rssi = ap_records[i].rssi;
+            networks.push_back(info);
+        }
+
+        // Stop WiFi but don't deinit (NetworkManager will reuse the driver)
+        esp_wifi_stop();
+        esp_wifi_deinit();
         ESP_LOGI(TAG, "Scanned %d WiFi networks for BLE listing", (int)networks.size());
 
         // Prepare current config for BLE restore
@@ -225,7 +282,9 @@ bool DeviceProfile::setup(AppController& app)
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        ble.stop();
+        // Full BLE teardown - release NimBLE + controller memory back to heap
+        ble.deinit();
+        vTaskDelay(pdMS_TO_TICKS(200));  // Let tasks clean up
 
         // Save all received config to NVS
         nvs_handle_t h;
@@ -267,8 +326,8 @@ bool DeviceProfile::setup(AppController& app)
     // =========================================================
     auto network_mgr = std::make_unique<NetworkManager>();
 
-    const std::string default_ws   = "171.226.10.121:8000";
-    const std::string default_mqtt = "171.226.10.121:1883";
+    const std::string default_ws   = "10.170.75.147:8000";//"171.226.10.121:8000";
+    const std::string default_mqtt = "10.170.75.147:1883"; //"171.226.10.121:1883";
 
     NetworkManager::Config net_cfg{};
     net_cfg.wifi_ssid = user.wifi_ssid;
@@ -278,10 +337,12 @@ bool DeviceProfile::setup(AppController& app)
     net_cfg.user_id   = user.user_id;
     net_cfg.tx_key    = user.tx_key;
 
+    ESP_LOGI(TAG, "Before NetworkManager init, free heap: %lu", (unsigned long)esp_get_free_heap_size());
     if (!network_mgr->init(net_cfg)) {
         ESP_LOGE(TAG, "NetworkManager init failed");
         return false;
     }
+    ESP_LOGI(TAG, "After NetworkManager init, free heap: %lu", (unsigned long)esp_get_free_heap_size());
 
     // Wire audio buffers to network
     network_mgr->setMicBuffer(audio_mgr->getMicEncodedBuffer());
@@ -291,13 +352,30 @@ bool DeviceProfile::setup(AppController& app)
     NetworkManager* network_ptr = network_mgr.get();
 
     // Downlink audio: server binary -> speaker buffer
+    // Parse individual length-prefixed frames from batch, write each atomically
     network_mgr->onServerBinary([spk_sb, network_ptr](const uint8_t* data, size_t len) {
         if (!data || len == 0) return;
         auto interaction = StateManager::instance().getInteractionState();
         if (interaction == state::InteractionState::LISTENING || !network_ptr->isSpeakingSessionActive()) {
             return;
         }
-        xStreamBufferSend(spk_sb, data, len, pdMS_TO_TICKS(100));
+
+        // Parse batch: each frame = [2-byte LE length][opus data]
+        size_t offset = 0;
+        while (offset + 2 <= len) {
+            uint16_t frame_len = data[offset] | ((uint16_t)data[offset + 1] << 8);
+            size_t total = 2 + frame_len;
+            if (frame_len == 0 || frame_len > 256 || offset + total > len) break;
+
+            // Only write complete frame — check space first
+            size_t space = xStreamBufferSpacesAvailable(spk_sb);
+            if (space >= total) {
+                xStreamBufferSend(spk_sb, data + offset, total, 0);
+            }
+            // else: drop this frame entirely (better than partial write)
+
+            offset += total;
+        }
     });
 
     // WS disconnect handler
