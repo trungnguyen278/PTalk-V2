@@ -53,7 +53,7 @@ void UartBridge::start()
     xTaskCreatePinnedToCore(
         &UartBridge::rxTaskEntry,
         "UartRxTask",
-        4096,
+        2048,
         this,
         3,
         &rx_task_,
