@@ -4,7 +4,7 @@
 namespace state
 {
 
-    // ---------- Interaction (mirrored from C5 via UART) ----------
+    // ---------- Interaction (S3 owns: has button+audio) ----------
     enum class InteractionState : uint8_t
     {
         IDLE,
@@ -17,7 +17,7 @@ namespace state
         SLEEPING
     };
 
-    // ---------- Connectivity (mirrored from C5 via UART) ----------
+    // ---------- Connectivity (mirrored from C5 via SPI) ----------
     enum class ConnectivityState : uint8_t
     {
         OFFLINE,
@@ -55,7 +55,7 @@ namespace state
         UNKNOWN
     };
 
-    // ---------- Emotion (received from C5 via UART) ----------
+    // ---------- Emotion (received from C5 via SPI) ----------
     enum class EmotionState : uint8_t
     {
         NEUTRAL,

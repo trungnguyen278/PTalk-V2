@@ -13,10 +13,8 @@ idf_component_register(
         "${CMAKE_SOURCE_DIR}/src"
         "${CMAKE_SOURCE_DIR}/include"
         "${CMAKE_SOURCE_DIR}/lib"
-        "${CMAKE_SOURCE_DIR}/lib/audio"
         "${CMAKE_SOURCE_DIR}/lib/network"
-        "${CMAKE_SOURCE_DIR}/lib/touch"
-        "${CMAKE_SOURCE_DIR}/lib/uart"
+        "${CMAKE_SOURCE_DIR}/lib/spi"
     REQUIRES
         driver
         esp_wifi

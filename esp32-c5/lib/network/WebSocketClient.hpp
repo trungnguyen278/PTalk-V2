@@ -4,6 +4,9 @@
 #include <functional>
 #include <vector>
 #include "esp_websocket_client.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/stream_buffer.h"
 
 /**
  * WebSocketClient
@@ -42,6 +45,9 @@ private:
     static void eventHandlerStatic(void* handler_args, esp_event_base_t base,
                                    int32_t event_id, void* event_data);
 
+    static void wsTxTaskEntry(void* arg);
+    void wsTxLoop();
+
     void eventHandler(esp_event_base_t base, int32_t event_id,
                       esp_websocket_event_data_t* data);
 
@@ -56,4 +62,8 @@ private:
     std::function<void(int)> status_cb;               // status
     std::function<void(const std::string&)> text_cb;  // text message
     std::function<void(const uint8_t*, size_t)> binary_cb; // binary message
+
+    StreamBufferHandle_t tx_buffer = nullptr;
+    TaskHandle_t tx_task = nullptr;
+    bool run_tx_task = false;
 };

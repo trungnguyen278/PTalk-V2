@@ -10,8 +10,6 @@
 
 namespace event {
     enum class AppEvent : uint8_t {
-        USER_BUTTON,
-        RELEASE_BUTTON,
         SLEEP_REQUEST,
         WAKE_REQUEST,
         REBOOT_REQUEST
@@ -19,12 +17,11 @@ namespace event {
 }
 
 class NetworkManager;
-class AudioManager;
-class TouchInput;
-class UartBridge;
+class SpiBridge;
 
-// AppController for ESP32-C5: simplified orchestrator.
-// No display, no BLE, no power manager, no OTA (those are on S3).
+// AppController for ESP32-C5: network-only orchestrator.
+// Audio, button, and display are now on S3. C5 handles WiFi/WS/MQTT and
+// relays data to/from S3 via SPI.
 class AppController {
 public:
     static AppController& instance();
@@ -36,12 +33,9 @@ public:
 
     void postEvent(event::AppEvent evt);
 
-    void attachModules(std::unique_ptr<AudioManager> audioIn,
-                       std::unique_ptr<NetworkManager> networkIn,
-                       std::unique_ptr<TouchInput> touchIn,
-                       std::unique_ptr<UartBridge> uartIn);
+    void attachModules(std::unique_ptr<NetworkManager> networkIn,
+                       std::unique_ptr<SpiBridge> spiIn);
 
-    // Emotion parsing (delegated to NetworkManager)
     static state::EmotionState parseEmotionCode(const std::string& code);
 
 private:
@@ -62,9 +56,7 @@ private:
     int sub_sys_id   = -1;
 
     std::unique_ptr<NetworkManager> network;
-    std::unique_ptr<AudioManager>   audio;
-    std::unique_ptr<TouchInput>     touch;
-    std::unique_ptr<UartBridge>     uart;
+    std::unique_ptr<SpiBridge>      spi;
 
     QueueHandle_t app_queue = nullptr;
     TaskHandle_t  app_task  = nullptr;

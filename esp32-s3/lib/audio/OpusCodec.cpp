@@ -65,6 +65,7 @@ bool OpusCodec::initCodec()
 size_t OpusCodec::encode(const int16_t* pcm_in, size_t pcm_samples,
                          uint8_t* encoded_out, size_t encoded_capacity)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || !pcm_in || !encoded_out) return 0;
     if (pcm_samples < FRAME_SAMPLES) return 0;
     if (encoded_capacity < MAX_ENCODED_BYTES + 2) return 0;
@@ -89,6 +90,7 @@ size_t OpusCodec::encode(const int16_t* pcm_in, size_t pcm_samples,
 size_t OpusCodec::decode(const uint8_t* encoded_in, size_t encoded_bytes,
                          int16_t* pcm_out, size_t pcm_capacity)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || !encoded_in || !pcm_out) return 0;
     if (encoded_bytes == 0) return 0;
     if (pcm_capacity < FRAME_SAMPLES) return 0;
@@ -105,6 +107,7 @@ size_t OpusCodec::decode(const uint8_t* encoded_in, size_t encoded_bytes,
 
 void OpusCodec::reset()
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (encoder_) {
         opus_encoder_ctl(encoder_, OPUS_RESET_STATE);
     }
@@ -116,6 +119,7 @@ void OpusCodec::reset()
 
 void OpusCodec::setBitrate(int bitrate_bps)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (encoder_) {
         opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(bitrate_bps));
         ESP_LOGI(TAG, "Bitrate set to %d bps", bitrate_bps);

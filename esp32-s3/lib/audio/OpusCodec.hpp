@@ -1,6 +1,7 @@
 #pragma once
 #include "AudioCodec.hpp"
 #include <cstdint>
+#include <mutex>
 
 // Forward declare opus types to avoid pulling in opus.h in the header
 struct OpusEncoder;
@@ -42,6 +43,7 @@ private:
     OpusEncoder* encoder_ = nullptr;
     OpusDecoder* decoder_ = nullptr;
     bool initialized_ = false;
+    std::mutex mutex_;
 
     bool initCodec();
 };

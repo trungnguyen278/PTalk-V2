@@ -1,7 +1,9 @@
 #include "AppController.hpp"
 #include "system/DisplayManager.hpp"
 #include "system/PowerManager.hpp"
-#include "system/UartBridge.hpp"
+#include "system/AudioManager.hpp"
+#include "system/SpiBridge.hpp"
+#include "TouchInput.hpp"
 
 #include "esp_log.h"
 #include <utility>
@@ -51,12 +53,16 @@ AppController::~AppController()
 
 void AppController::attachModules(std::unique_ptr<DisplayManager> displayIn,
                                    std::unique_ptr<PowerManager> powerIn,
-                                   std::unique_ptr<UartBridge> uartIn)
+                                   std::unique_ptr<AudioManager> audioIn,
+                                   std::unique_ptr<SpiBridge> spiIn,
+                                   std::unique_ptr<TouchInput> touchIn)
 {
     if (started.load()) return;
     display = std::move(displayIn);
     power   = std::move(powerIn);
-    uart    = std::move(uartIn);
+    audio   = std::move(audioIn);
+    spi     = std::move(spiIn);
+    touch   = std::move(touchIn);
 }
 
 // === Lifecycle ===
@@ -119,10 +125,12 @@ void AppController::start()
     xTaskCreatePinnedToCore(&AppController::controllerTask, "AppCtrl", 4096, this, 4, &app_task, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Start modules: Display -> Power -> UART
+    // Start modules
     if (display) display->start();
     if (power) power->start();
-    if (uart) uart->start();
+    if (spi) spi->start();
+    if (audio) audio->start();
+    if (touch) touch->start();
 
     ESP_LOGI(TAG, "AppController started");
 }
@@ -132,9 +140,11 @@ void AppController::stop()
     if (!started.load()) return;
     started.store(false);
 
+    if (audio) audio->stop();
+    if (touch) touch->stop();
+    if (spi) spi->stop();
     if (display) display->stop();
     if (power) power->stop();
-    if (uart) uart->stop();
 
     vTaskDelay(pdMS_TO_TICKS(100));
     app_task = nullptr;
@@ -144,7 +154,7 @@ void AppController::stop()
 void AppController::reboot()
 {
     ESP_LOGW(TAG, "Reboot requested");
-    if (uart) uart->sendCommand(uart_proto::Command::REBOOT);
+    if (spi) spi->sendControlCmd(spi_proto::ControlCmd::REBOOT);
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
 }
@@ -188,6 +198,24 @@ void AppController::processQueue()
                 break;
             case AppMessage::Type::APP_EVENT:
                 switch (msg.app_event) {
+                case event::AppEvent::USER_BUTTON:
+                    // Button press: check connectivity (received from C5 via SPI)
+                    if (StateManager::instance().getConnectivityState() != state::ConnectivityState::ONLINE) {
+                        ESP_LOGW(TAG, "Button ignored - not online");
+                        break;
+                    }
+                    if (audio && StateManager::instance().getInteractionState() == state::InteractionState::SPEAKING) {
+                        audio->stopSpeaking();
+                    }
+                    StateManager::instance().setInteractionState(
+                        state::InteractionState::LISTENING, state::InputSource::BUTTON);
+                    break;
+                case event::AppEvent::RELEASE_BUTTON:
+                    if (StateManager::instance().getInteractionState() == state::InteractionState::LISTENING) {
+                        StateManager::instance().setInteractionState(
+                            state::InteractionState::IDLE, state::InputSource::BUTTON);
+                    }
+                    break;
                 case event::AppEvent::REBOOT_REQUEST:
                     reboot();
                     break;
@@ -208,16 +236,49 @@ void AppController::processQueue()
 void AppController::onInteractionStateChanged(state::InteractionState s, state::InputSource src)
 {
     ESP_LOGI(TAG, "Interaction: %d (src=%d)", (int)s, (int)src);
+
+    // Forward interaction state to C5 via SPI
+    if (spi) {
+        auto& sm = StateManager::instance();
+        if (s == state::InteractionState::LISTENING && src == state::InputSource::BUTTON) {
+            spi->sendControlCmd(spi_proto::ControlCmd::START);
+        } else if (s == state::InteractionState::IDLE && src == state::InputSource::BUTTON) {
+            spi->sendControlCmd(spi_proto::ControlCmd::END);
+        }
+    }
+
+    switch (s) {
+    case state::InteractionState::TRIGGERED:
+        StateManager::instance().setInteractionState(state::InteractionState::LISTENING, src);
+        break;
+    case state::InteractionState::CANCELLING:
+        StateManager::instance().setInteractionState(state::InteractionState::IDLE, state::InputSource::UNKNOWN);
+        break;
+    default:
+        break;
+    }
 }
 
 void AppController::onConnectivityStateChanged(state::ConnectivityState s)
 {
     ESP_LOGI(TAG, "Connectivity: %d", (int)s);
+
+    if (s == state::ConnectivityState::OFFLINE && audio) {
+        audio->stopAll();
+        StateManager::instance().setInteractionState(
+            state::InteractionState::IDLE, state::InputSource::UNKNOWN);
+    }
 }
 
 void AppController::onSystemStateChanged(state::SystemState s)
 {
     ESP_LOGI(TAG, "System: %d", (int)s);
+
+    if (s == state::SystemState::ERROR && audio) {
+        audio->stopAll();
+        StateManager::instance().setInteractionState(
+            state::InteractionState::IDLE, state::InputSource::UNKNOWN);
+    }
 }
 
 void AppController::onPowerStateChanged(state::PowerState s)

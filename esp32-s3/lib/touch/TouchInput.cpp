@@ -42,7 +42,7 @@ void TouchInput::start()
     xTaskCreatePinnedToCore(
         taskEntry,
         "TouchInput",
-        2048,
+        4096,
         this,
         3,
         &task_,

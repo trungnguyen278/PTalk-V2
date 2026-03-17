@@ -77,9 +77,9 @@ void MqttClient::start()
     cfg.session.disable_keepalive = false;
 
     // Network
-    cfg.network.disable_auto_reconnect = true;
-    cfg.network.reconnect_timeout_ms = 2000;
-    cfg.network.timeout_ms = 3000;  // Short connect timeout (default 10s blocks esp-tls)
+    cfg.network.disable_auto_reconnect = false;
+    cfg.network.reconnect_timeout_ms = 5000;
+    cfg.network.timeout_ms = 5000;  // Short connect timeout (default 10s blocks esp-tls)
 
     // Buffer
     cfg.buffer.size = 512;

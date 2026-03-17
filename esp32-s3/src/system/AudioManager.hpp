@@ -10,13 +10,17 @@
 class AudioInput;
 class AudioOutput;
 class AudioCodec;
+class SpiBridge;
 
-// Audio pipeline manager for ESP32-C5.
-// Tasks (matching architecture diagram):
-//   - Task doc mic:     I2S RX -> Buffer MIC DMA (sb_mic_pcm)
-//   - Task Stream mic:  sb_mic_pcm -> Encode -> sb_mic_encoded (for uplink)
-//   - Task Nhan Audio:  sb_spk_encoded (downlink) -> Decode -> sb_spk_pcm
-//   - Task phat audio:  sb_spk_pcm -> I2S TX
+// Audio pipeline manager for ESP32-S3.
+// Same 4-task architecture as the C5 version, but uplink/downlink go through
+// SpiBridge (SPI to C5) instead of directly to WebSocket.
+//
+// Tasks:
+//   - MicRead:    I2S RX -> sb_mic_pcm
+//   - MicStream:  sb_mic_pcm -> Encode -> sb_mic_encoded -> SpiBridge uplink
+//   - AudioRecv:  sb_spk_encoded (from SpiBridge downlink) -> Decode -> sb_spk_pcm
+//   - SpkPlay:    sb_spk_pcm -> I2S TX
 class AudioManager {
 public:
     AudioManager();
@@ -26,20 +30,17 @@ public:
     bool init();
     void start();
     void stop();
-    bool allocateResources();
-    void freeResources();
 
     // Dependency injection
     void setInput(std::unique_ptr<AudioInput> in);
     void setOutput(std::unique_ptr<AudioOutput> out);
     void setCodec(std::unique_ptr<AudioCodec> cdc);
+    void setSpiBridge(SpiBridge* bridge);
 
-    // Stream buffer access (for NetworkManager uplink/downlink)
-    StreamBufferHandle_t getMicEncodedBuffer()     const { return sb_mic_encoded; }
+    // Stream buffer access (for SpiBridge downlink writing)
     StreamBufferHandle_t getSpeakerEncodedBuffer() const { return sb_spk_encoded; }
 
     // Control
-    void setPowerSaving(bool enable);
     void setVolume(uint8_t percent);
 
     // Audio actions
@@ -60,28 +61,28 @@ private:
     static void spkPlayTaskEntry(void* arg);
 
     // Task loops
-    void micReadLoop();      // Task doc mic
-    void micStreamLoop();    // Task Stream mic (encode)
-    void audioRecvLoop();    // Task Nhan Audio (decode)
-    void spkPlayLoop();      // Task phat audio
+    void micReadLoop();
+    void micStreamLoop();
+    void audioRecvLoop();
+    void spkPlayLoop();
 
     // State
     std::atomic<bool> started{false};
     std::atomic<bool> listening{false};
     std::atomic<bool> speaking{false};
-    std::atomic<bool> power_saving{false};
     state::InputSource current_source = state::InputSource::UNKNOWN;
 
     // Components
     std::unique_ptr<AudioInput>  input;
     std::unique_ptr<AudioOutput> output;
     std::unique_ptr<AudioCodec>  codec;
+    SpiBridge* spi_bridge_ = nullptr;
 
     // Stream buffers
-    StreamBufferHandle_t sb_mic_pcm     = nullptr; // Raw PCM from mic (Buffer MIC DMA)
-    StreamBufferHandle_t sb_mic_encoded = nullptr; // Encoded uplink
-    StreamBufferHandle_t sb_spk_pcm     = nullptr; // Decoded PCM to speaker (Buffer Speaker)
-    StreamBufferHandle_t sb_spk_encoded = nullptr; // Encoded downlink
+    StreamBufferHandle_t sb_mic_pcm     = nullptr;
+    StreamBufferHandle_t sb_mic_encoded = nullptr;
+    StreamBufferHandle_t sb_spk_pcm     = nullptr;
+    StreamBufferHandle_t sb_spk_encoded = nullptr;
 
     // Tasks
     TaskHandle_t mic_read_task   = nullptr;

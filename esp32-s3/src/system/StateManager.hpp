@@ -6,8 +6,9 @@
 
 // Central state hub for ESP32-S3.
 // Manages interaction, connectivity, system, power, and emotion state.
-// Interaction/Connectivity/Emotion are mirrored from C5 via UART.
-// Power state is managed locally (battery ADC on S3).
+// S3 owns: InteractionState (button+audio), PowerState (battery ADC).
+// C5 owns: ConnectivityState (WiFi/WS), EmotionState (parses WS text).
+// Synced via SPI bridge.
 class StateManager {
 public:
     using InteractionCb  = std::function<void(state::InteractionState, state::InputSource)>;
