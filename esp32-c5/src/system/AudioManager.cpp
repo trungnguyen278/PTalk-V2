@@ -46,11 +46,11 @@ bool AudioManager::init()
         return false;
     }
 
-    // Create stream buffers (balanced for RAM — keep ~25KB free for WS+MQTT)
-    sb_mic_pcm     = xStreamBufferCreate(2 * 1024, 1);
-    sb_mic_encoded = xStreamBufferCreate(4 * 1024, 1);    // 4KB mic encoded (was 8KB)
-    sb_spk_pcm     = xStreamBufferCreate(4 * 1024, 1);    // 4KB PCM + pre-buffer logic
-    sb_spk_encoded = xStreamBufferCreate(4 * 1024, 1);    // 4KB encoded downlink
+    // Stream buffers sized for 48kHz (960 samples/frame = 1920 bytes PCM per frame)
+    sb_mic_pcm     = xStreamBufferCreate(2 * 1024, 1);    // 2KB mic PCM
+    sb_mic_encoded = xStreamBufferCreate(2 * 1024, 1);    // 2KB mic encoded
+    sb_spk_pcm     = xStreamBufferCreate(4 * 1024, 1);    // 4KB PCM playback (~2 frames)
+    sb_spk_encoded = xStreamBufferCreate(6 * 1024, 1);    // 6KB encoded downlink
 
     if (!sb_mic_pcm || !sb_mic_encoded || !sb_spk_pcm || !sb_spk_encoded) {
         ESP_LOGE(TAG, "Failed to create stream buffers");
@@ -76,7 +76,7 @@ void AudioManager::start()
     // Task doc mic (reads I2S -> sb_mic_pcm)
     xTaskCreatePinnedToCore(&AudioManager::micReadTaskEntry, "MicRead", 3072, this, 6, &mic_read_task, 0);
     // Task Stream mic (encode sb_mic_pcm -> sb_mic_encoded)
-    xTaskCreatePinnedToCore(&AudioManager::micStreamTaskEntry, "MicStream", 24576, this, 5, &mic_stream_task, 0);
+    xTaskCreatePinnedToCore(&AudioManager::micStreamTaskEntry, "MicStream", 28672, this, 5, &mic_stream_task, 0);
     // Task Nhan Audio (decode sb_spk_encoded -> sb_spk_pcm)
     xTaskCreatePinnedToCore(&AudioManager::audioRecvTaskEntry, "AudioRecv", 16384, this, 5, &audio_recv_task, 0);
     // Task phat audio (sb_spk_pcm -> I2S TX)
@@ -102,9 +102,9 @@ bool AudioManager::allocateResources()
 {
     if (sb_mic_pcm != nullptr) return true;
     sb_mic_pcm     = xStreamBufferCreate(2 * 1024, 1);
-    sb_mic_encoded = xStreamBufferCreate(4 * 1024, 1);
+    sb_mic_encoded = xStreamBufferCreate(2 * 1024, 1);
     sb_spk_pcm     = xStreamBufferCreate(4 * 1024, 1);
-    sb_spk_encoded = xStreamBufferCreate(4 * 1024, 1);
+    sb_spk_encoded = xStreamBufferCreate(6 * 1024, 1);
     return (sb_mic_pcm && sb_mic_encoded && sb_spk_pcm && sb_spk_encoded);
 }
 
@@ -234,12 +234,12 @@ void AudioManager::micReadLoop()
         size_t samples = input->readPcm(pcm_buf, PCM_FRAME);
         if (samples == 0) {
             zero_count++;
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(1);  // At least 1 tick (pdMS_TO_TICKS(5) can be 0)
             continue;
         }
 
         read_count++;
-        if (read_count == 1 || read_count % 100 == 0) {
+        if (read_count == 1 || read_count % 1000 == 0) {
             ESP_LOGI(TAG, "MicRead: #%lu, %zu samples, first=%d",
                      (unsigned long)read_count, samples, pcm_buf[0]);
         }
@@ -310,8 +310,8 @@ void AudioManager::audioRecvLoop()
     ESP_LOGI(TAG, "AudioRecv task started");
 
     const size_t pcm_frame = codec->pcmFrameSamples();
-    constexpr size_t ENC_PREBUF = 1500;  // ~12 frames = 240ms encoded pre-buffer
-    uint8_t* frame_data = new uint8_t[300];
+    constexpr size_t ENC_PREBUF = 2000;  // ~12 Opus frames pre-buffer
+    uint8_t* frame_data = new uint8_t[512];   // Opus encoded frame (max ~240 bytes @ 96kbps)
     int16_t* pcm_out = new int16_t[pcm_frame];
     bool new_session = true;
     bool enc_prebuffered = false;
@@ -345,7 +345,7 @@ void AudioManager::audioRecvLoop()
         if (got < 2) continue;
 
         uint16_t frame_len = header[0] | ((uint16_t)header[1] << 8);
-        if (frame_len == 0 || frame_len > 256) {
+        if (frame_len == 0 || frame_len > 500) {
             ESP_LOGE(TAG, "AudioRecv: bad frame len %u, resetting", frame_len);
             xStreamBufferReset(sb_spk_encoded);
             continue;
@@ -366,17 +366,31 @@ void AudioManager::audioRecvLoop()
             ESP_LOGI(TAG, "New decode session started");
         }
 
-        // Decode: build length-prefixed buffer for codec->decode()
-        uint8_t decode_buf[258];
-        decode_buf[0] = header[0];
-        decode_buf[1] = header[1];
-        memcpy(decode_buf + 2, frame_data, frame_len);
-
         uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-        size_t out_samples = codec->decode(decode_buf, 2 + frame_len, pcm_out, pcm_frame);
+        size_t out_samples = codec->decode(frame_data, frame_len, pcm_out, pcm_frame);
         uint32_t t1 = (uint32_t)(esp_timer_get_time() / 1000);
 
         if (out_samples > 0) {
+            // Smooth frame boundary discontinuities with quadratic crossfade.
+            // Quadratic taper: correction = gap * ((BLEND-i)/BLEND)^2
+            // Unlike linear, derivative goes to zero at the blend boundary,
+            // eliminating the secondary step that linear taper creates.
+            static int16_t prev_frame_last = 0;
+            if (decode_count > 0) {
+                const int BLEND = 80;  // ~1.7ms at 48kHz
+                int32_t gap = (int32_t)pcm_out[0] - (int32_t)prev_frame_last;
+                for (int i = 0; i < BLEND && i < (int)out_samples; ++i) {
+                    int32_t t = BLEND - i;  // counts down from BLEND to 1
+                    // quadratic: gap * t^2 / BLEND^2
+                    int32_t correction = (int32_t)(((int64_t)gap * t * t) / ((int32_t)BLEND * BLEND));
+                    int32_t val = (int32_t)pcm_out[i] - correction;
+                    if (val > 32767) val = 32767;
+                    if (val < -32768) val = -32768;
+                    pcm_out[i] = (int16_t)val;
+                }
+            }
+            prev_frame_last = pcm_out[out_samples - 1];
+
             xStreamBufferSend(sb_spk_pcm, pcm_out, out_samples * sizeof(int16_t), pdMS_TO_TICKS(200));
         }
 
@@ -406,7 +420,7 @@ void AudioManager::spkPlayLoop()
     ESP_LOGI(TAG, "SpkPlay task started");
 
     constexpr size_t PCM_CHUNK = 256;
-    constexpr size_t PREBUF_BYTES = 3200;  // ~100ms at 16kHz mono 16-bit (5 Opus frames)
+    constexpr size_t PREBUF_BYTES = 3840;  // ~40ms at 48kHz mono 16-bit (2 frames)
     int16_t pcm_chunk[PCM_CHUNK];
     bool i2s_started = false;
     bool prebuffered = false;
@@ -439,38 +453,9 @@ void AudioManager::spkPlayLoop()
                 continue;
             }
             i2s_started = true;
-            ESP_LOGI(TAG, "I2S playback started (SW SINE TEST)");
+            ESP_LOGI(TAG, "I2S playback started");
         }
 
-#if 1  // DEBUG: Integer sine wave test (bypass Opus decode)
-        {
-            // 440Hz sine at 16kHz: period = 16000/440 ≈ 36.36 samples
-            // Pre-computed 37-sample LUT (one full cycle, amplitude ≈ 8000)
-            static const int16_t sine_lut[] = {
-                0, 1357, 2651, 3825, 4826, 5612, 6147, 6409,
-                6389, 6092, 5536, 4749, 3767, 2632, 1393, 100,
-                -1196, -2441, -3581, -4568, -5357, -5913, -6214, -6248,
-                -6016, -5531, -4815, -3900, -2826, -1636, -379, 896,
-                2136, 3289, 4306, 5143, 5765, 6143
-            };
-            static const size_t LUT_LEN = sizeof(sine_lut) / sizeof(sine_lut[0]);
-            static size_t lut_idx = 0;
-
-            for (size_t i = 0; i < PCM_CHUNK; ++i) {
-                pcm_chunk[i] = sine_lut[lut_idx];
-                if (++lut_idx >= LUT_LEN) lut_idx = 0;
-            }
-            size_t samples = PCM_CHUNK;
-            // Drain the stream buffer so it doesn't fill up
-            while (xStreamBufferBytesAvailable(sb_spk_pcm) > 0) {
-                int16_t tmp[64];
-                xStreamBufferReceive(sb_spk_pcm, tmp, sizeof(tmp), 0);
-            }
-            uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-            output->writePcm(pcm_chunk, samples);
-            uint32_t t1 = (uint32_t)(esp_timer_get_time() / 1000);
-            size_t got = samples * sizeof(int16_t);
-#else  // Normal: read from stream buffer
         size_t got = xStreamBufferReceive(
             sb_spk_pcm, pcm_chunk, sizeof(pcm_chunk), pdMS_TO_TICKS(100));
 
@@ -479,7 +464,6 @@ void AudioManager::spkPlayLoop()
             uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
             output->writePcm(pcm_chunk, samples);
             uint32_t t1 = (uint32_t)(esp_timer_get_time() / 1000);
-#endif
 
             static uint32_t total_samples = 0;
             static uint32_t start_ms = 0;
@@ -488,10 +472,10 @@ void AudioManager::spkPlayLoop()
             total_samples += samples;
             write_count++;
 
-            // Log every 16000 samples (~1 second of audio)
-            if (total_samples >= 16000 && write_count % 63 == 0) {
+            // Log every ~1 second of audio
+            if (total_samples >= 48000 && write_count % 1880 == 0) {
                 uint32_t elapsed = t1 - start_ms;
-                uint32_t expected = (total_samples * 1000) / 16000;
+                uint32_t expected = (total_samples * 1000) / 48000;
                 ESP_LOGI(TAG, "SpkPlay: %lu samples in %lums (expected %lums), write=%lums, got=%zu",
                          (unsigned long)total_samples, (unsigned long)elapsed,
                          (unsigned long)expected, (unsigned long)(t1 - t0), got);

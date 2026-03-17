@@ -17,7 +17,6 @@
 // Codec - use interface for easy switching
 #include "AudioCodec.hpp"
 #include "OpusCodec.hpp"
-#include "AdpcmCodec.hpp"
 
 // Pin config
 #include "config/PinConfig.hpp"
@@ -154,7 +153,7 @@ bool DeviceProfile::setup(AppController& app)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(
         (i2s_port_t)PinConfig::I2S_NUM, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num  = 4;
-    chan_cfg.dma_frame_num = 240;  // 15ms per desc × 4 = 60ms total DMA buffer
+    chan_cfg.dma_frame_num = 240;  // 5ms per desc × 4 = 20ms total DMA buffer @ 48kHz
 
     esp_err_t err = i2s_new_channel(&chan_cfg, &tx_chan, &rx_chan);
     if (err != ESP_OK) {
@@ -172,7 +171,7 @@ bool DeviceProfile::setup(AppController& app)
         .pin_bclk    = (gpio_num_t)PinConfig::MIC_BCLK,
         .pin_ws      = (gpio_num_t)PinConfig::MIC_WS,
         .pin_din     = (gpio_num_t)PinConfig::MIC_DOUT,
-        .sample_rate = 16000
+        .sample_rate = 48000
     };
     auto mic = std::make_unique<I2SAudioInput_ICS43434>(rx_chan, mic_cfg);
 
@@ -181,20 +180,14 @@ bool DeviceProfile::setup(AppController& app)
         .pin_bclk    = (gpio_num_t)PinConfig::SPK_BCLK,
         .pin_ws      = (gpio_num_t)PinConfig::SPK_WS,
         .pin_dout    = (gpio_num_t)PinConfig::SPK_DIN,
-        .sample_rate = 16000
+        .sample_rate = 48000
     };
     auto speaker = std::make_unique<I2SAudioOutput_MAX98357>(tx_chan, spk_cfg);
     speaker->init();  // Init TX std mode
     speaker->setVolume(user.volume);
 
-    // Codec: Opus (primary) or ADPCM (fallback)
-    #ifdef USE_ADPCM_CODEC
-        auto codec = std::make_unique<AdpcmCodec>();
-        ESP_LOGI(TAG, "Using ADPCM codec");
-    #else
-        auto codec = std::make_unique<OpusCodec>();
-        ESP_LOGI(TAG, "Using Opus codec");
-    #endif
+    auto codec = std::make_unique<OpusCodec>();
+    ESP_LOGI(TAG, "Using Opus codec");
 
     audio_mgr->setInput(std::move(mic));
     audio_mgr->setOutput(std::move(speaker));
@@ -365,7 +358,7 @@ ESP_LOGI(TAG, "After AudioManager init, free heap: %lu", (unsigned long)esp_get_
         while (offset + 2 <= len) {
             uint16_t frame_len = data[offset] | ((uint16_t)data[offset + 1] << 8);
             size_t total = 2 + frame_len;
-            if (frame_len == 0 || frame_len > 256 || offset + total > len) break;
+            if (frame_len == 0 || frame_len > 500 || offset + total > len) break;
 
             // Only write complete frame — check space first
             size_t space = xStreamBufferSpacesAvailable(spk_sb);

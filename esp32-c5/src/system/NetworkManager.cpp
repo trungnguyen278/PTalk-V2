@@ -128,7 +128,7 @@ void NetworkManager::setupWebSocket()
             // Lazy MQTT: only start if enough heap (MQTT needs ~9KB, keep 15KB for WiFi/WS)
             if (!mqtt_ && !cfg_.mqtt_url.empty()) {
                 size_t free_heap = esp_get_free_heap_size();
-                if (free_heap > 24000) {
+                if (free_heap > 35000) {
                     ESP_LOGI(TAG, "Lazy MQTT init (free heap: %lu)", (unsigned long)free_heap);
                     mqtt_ = std::make_unique<MqttClient>();
                     mqtt_->init();
@@ -138,7 +138,7 @@ void NetworkManager::setupWebSocket()
                     mqtt_->setCredentials(user, cfg_.tx_key);
                     mqtt_->start();
                 } else {
-                    ESP_LOGW(TAG, "MQTT skipped - low heap (%lu bytes), need >24KB", (unsigned long)free_heap);
+                    ESP_LOGW(TAG, "MQTT skipped - low heap (%lu bytes), need >35KB", (unsigned long)free_heap);
                 }
             }
             break;

@@ -48,7 +48,7 @@ except (ImportError, Exception):
 
 import numpy as np
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 48000
 CHANNELS = 1
 SAMPLE_WIDTH = 2  # 16-bit
 
@@ -186,12 +186,12 @@ class AdpcmEncoder:
 class OpusCodecWrapper:
     """Wrapper for Opus encode/decode."""
 
-    FRAME_SIZE = 320  # 20ms @ 16kHz
+    FRAME_SIZE = 960  # 20ms @ 48kHz
 
     def __init__(self):
         if HAS_OPUS:
             self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_AUDIO)
-            self.encoder.bitrate = 48000  # 48kbps for music quality
+            self.encoder.bitrate = 64000  # 64kbps
             self.encoder.complexity = 10  # Max quality (server has plenty of CPU)
             self.decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
         else:
@@ -297,7 +297,7 @@ async def handle_device(websocket, args):
 
     # Pre-load WAV file if specified
     if args.wav_file and os.path.exists(args.wav_file):
-        wav_data = load_wav_as_encoded(args.wav_file, args.codec)
+        wav_data = load_wav_as_encoded(args.wav_file)
         print(f"  [WAV] Loaded {args.wav_file} ({len(wav_data)} frames)")
 
     try:
@@ -354,7 +354,7 @@ async def handle_device(websocket, args):
 
                             # Stream audio in batches to reduce WS overhead
                             # Batch 10 frames (~200ms audio) per WS message
-                            # Send at ~1.2x real-time to build buffer on device
+                            # Send at ~1.05x real-time to build buffer gradually
                             BATCH_SIZE = 10
                             for i in range(0, len(response_frames), BATCH_SIZE):
                                 batch = response_frames[i:i + BATCH_SIZE]
@@ -363,8 +363,8 @@ async def handle_device(websocket, args):
                                     await websocket.send(batch_data)
                                 except Exception:
                                     break
-                                # Sleep less than real-time: 200ms audio → 160ms sleep
-                                await asyncio.sleep(0.016 * len(batch))
+                                # 19ms/frame: slightly faster than 20ms real-time
+                                await asyncio.sleep(0.019 * len(batch))
                                 sent = i + len(batch)
                                 if sent % 100 < BATCH_SIZE:
                                     print(f"  [STREAM] {sent}/{len(response_frames)} frames sent ({sent*0.02:.1f}s)", end='\r')
@@ -398,7 +398,7 @@ async def handle_device(websocket, args):
     print(f"[SESSION END] Total sessions: {session.session_count}")
 
 
-def load_wav_as_encoded(wav_path: str, codec_type: str) -> list:
+def load_wav_as_encoded(wav_path: str) -> list:
     """Load a WAV file and encode it for streaming."""
     with wave.open(wav_path, 'r') as wf:
         sr = wf.getframerate()
@@ -434,22 +434,14 @@ def load_wav_as_encoded(wav_path: str, codec_type: str) -> list:
     data = data.astype(np.int16)
     print(f"  [WAV] Loaded: {len(data)} samples, {len(data)/SAMPLE_RATE:.1f}s, resampled {sr}->{SAMPLE_RATE}Hz")
 
-    # Encode in frames
+    # Encode in Opus frames
     frames = []
-    if codec_type == 'opus':
-        codec = OpusCodecWrapper()
-        frame_size = 320  # 20ms
-        for i in range(0, len(data) - frame_size + 1, frame_size):
-            chunk = data[i:i + frame_size]
-            encoded = codec.encode_frame(chunk)
-            if encoded:
-                frames.append(encoded)
-    else:
-        encoder = AdpcmEncoder()
-        frame_size = 256  # Match ESP32
-        for i in range(0, len(data) - frame_size + 1, frame_size):
-            chunk = data[i:i + frame_size]
-            encoded = encoder.encode_frame(chunk)
+    codec = OpusCodecWrapper()
+    frame_size = 960  # 20ms @ 48kHz
+    for i in range(0, len(data) - frame_size + 1, frame_size):
+        chunk = data[i:i + frame_size]
+        encoded = codec.encode_frame(chunk)
+        if encoded:
             frames.append(encoded)
 
     return frames
@@ -480,8 +472,8 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PTalk V2 Test Server")
     parser.add_argument("--port", type=int, default=8000, help="WebSocket port (default: 8000)")
-    parser.add_argument("--codec", choices=["opus", "adpcm"], default="opus",
-                        help="Audio codec (default: opus)")
+    parser.add_argument("--codec", default="opus",
+                        help="Audio codec (opus)")
     parser.add_argument("--echo", action="store_true", default=True,
                         help="Echo recorded audio back (default: True)")
     parser.add_argument("--wav-file", type=str, default=None,
