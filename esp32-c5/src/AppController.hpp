@@ -18,6 +18,7 @@ namespace event {
 
 class NetworkManager;
 class SpiBridge;
+class UartBridge;
 
 // AppController for ESP32-C5: network-only orchestrator.
 // Audio, button, and display are now on S3. C5 handles WiFi/WS/MQTT and
@@ -34,7 +35,8 @@ public:
     void postEvent(event::AppEvent evt);
 
     void attachModules(std::unique_ptr<NetworkManager> networkIn,
-                       std::unique_ptr<SpiBridge> spiIn);
+                       std::unique_ptr<SpiBridge> spiIn,
+                       std::unique_ptr<UartBridge> uartIn);
 
     static state::EmotionState parseEmotionCode(const std::string& code);
 
@@ -57,6 +59,7 @@ private:
 
     std::unique_ptr<NetworkManager> network;
     std::unique_ptr<SpiBridge>      spi;
+    std::unique_ptr<UartBridge>     uart;
 
     QueueHandle_t app_queue = nullptr;
     TaskHandle_t  app_task  = nullptr;

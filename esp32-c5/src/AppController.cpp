@@ -1,6 +1,7 @@
 #include "AppController.hpp"
 #include "system/NetworkManager.hpp"
 #include "system/SpiBridge.hpp"
+#include "system/UartBridge.hpp"
 
 #include "esp_log.h"
 #include <utility>
@@ -43,11 +44,13 @@ AppController::~AppController()
 // === Module attachment ===
 
 void AppController::attachModules(std::unique_ptr<NetworkManager> networkIn,
-                                   std::unique_ptr<SpiBridge> spiIn)
+                                   std::unique_ptr<SpiBridge> spiIn,
+                                   std::unique_ptr<UartBridge> uartIn)
 {
     if (started.load()) return;
     network = std::move(networkIn);
     spi     = std::move(spiIn);
+    uart    = std::move(uartIn);
 }
 
 // === Lifecycle ===
@@ -98,6 +101,7 @@ void AppController::start()
 
     if (network) network->start();
     if (spi) spi->start();
+    if (uart) uart->start();
 
     ESP_LOGI(TAG, "AppController started");
 }
@@ -107,6 +111,7 @@ void AppController::stop()
     if (!started.load()) return;
     started.store(false);
 
+    if (uart) uart->stop();
     if (network) network->stop();
     if (spi) spi->stop();
 
@@ -182,9 +187,9 @@ void AppController::onInteractionStateChanged(state::InteractionState s, state::
 {
     ESP_LOGI(TAG, "Interaction: %d (src=%d)", (int)s, (int)src);
 
-    // Forward state to S3 via SPI
-    if (spi) {
-        spi->sendStatusUpdate(
+    // Forward state to S3 via UART
+    if (uart) {
+        uart->sendStatusUpdate(
             (uint8_t)s,
             (uint8_t)StateManager::instance().getConnectivityState(),
             (uint8_t)StateManager::instance().getSystemState(),
@@ -201,9 +206,9 @@ void AppController::onConnectivityStateChanged(state::ConnectivityState s)
 {
     ESP_LOGI(TAG, "Connectivity: %d", (int)s);
 
-    // Forward to S3 via SPI
-    if (spi) {
-        spi->sendStatusUpdate(
+    // Forward to S3 via UART
+    if (uart) {
+        uart->sendStatusUpdate(
             (uint8_t)StateManager::instance().getInteractionState(),
             (uint8_t)s,
             (uint8_t)StateManager::instance().getSystemState(),
