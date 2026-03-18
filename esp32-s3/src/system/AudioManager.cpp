@@ -49,13 +49,13 @@ bool AudioManager::init()
     }
 
     // S3 has PSRAM — use larger buffers than C5
+    // sb_mic_encoded is unused (MicStream sends directly to SPI, no intermediate buffer)
     // Speaker encoded buffer is 16KB to absorb SPI jitter from C5 relay
     sb_mic_pcm     = xStreamBufferCreate(4 * 1024, 1);
-    sb_mic_encoded = xStreamBufferCreate(4 * 1024, 1);
     sb_spk_pcm     = xStreamBufferCreate(8 * 1024, 1);
     sb_spk_encoded = xStreamBufferCreate(16 * 1024, 1);
 
-    if (!sb_mic_pcm || !sb_mic_encoded || !sb_spk_pcm || !sb_spk_encoded) {
+    if (!sb_mic_pcm || !sb_spk_pcm || !sb_spk_encoded) {
         ESP_LOGE(TAG, "Failed to create stream buffers");
         return false;
     }
@@ -142,7 +142,6 @@ void AudioManager::stopListening()
     listening = false;
     input->stopCapture();
     if (sb_mic_pcm) xStreamBufferReset(sb_mic_pcm);
-    if (sb_mic_encoded) xStreamBufferReset(sb_mic_encoded);
     if (codec) codec->reset();
 }
 
@@ -250,16 +249,16 @@ void AudioManager::micStreamLoop()
             size_t enc_len = codec->encode(pcm_in, pcm_frame, encoded, max_encoded);
             accum = 0;
             if (enc_len > 0 && spi_bridge_) {
-                // Prepend 2-byte LE length prefix so C5 can relay to WS as-is
-                // WS TX loop on C5 expects [2-byte len][opus data] framing
-                uint8_t prefixed[spi_proto::MAX_PAYLOAD];
-                if (enc_len + 2 <= spi_proto::MAX_PAYLOAD) {
-                    prefixed[0] = (uint8_t)(enc_len & 0xFF);
-                    prefixed[1] = (uint8_t)((enc_len >> 8) & 0xFF);
-                    memcpy(&prefixed[2], encoded, enc_len);
-                    spi_bridge_->sendAudioUplink(prefixed, enc_len + 2);
+                // OpusCodec::encode() already returns [2B LE len][opus data]
+                // Send directly — C5 relays to WS tx_buffer as-is
+                if (enc_len <= spi_proto::MAX_PAYLOAD) {
+                    spi_bridge_->sendAudioUplink(encoded, enc_len);
                 }
             }
+            // Yield after each encode so IDLE1 can reset the watchdog.
+            // Opus encode at complexity 3 takes several ms — without this,
+            // back-to-back encodes starve IDLE1 on Core 1.
+            taskYIELD();
         }
     }
 
@@ -330,21 +329,9 @@ void AudioManager::audioRecvLoop()
 
         size_t out_samples = codec->decode(frame_data, frame_len, pcm_out, pcm_frame);
         if (out_samples > 0) {
-            // Quadratic crossfade at frame boundaries
-            static int16_t prev_frame_last = 0;
-            if (decode_count > 0) {
-                const int BLEND = 80;
-                int32_t gap = (int32_t)pcm_out[0] - (int32_t)prev_frame_last;
-                for (int i = 0; i < BLEND && i < (int)out_samples; ++i) {
-                    int32_t t = BLEND - i;
-                    int32_t correction = (int32_t)(((int64_t)gap * t * t) / ((int32_t)BLEND * BLEND));
-                    int32_t val = (int32_t)pcm_out[i] - correction;
-                    if (val > 32767) val = 32767;
-                    if (val < -32768) val = -32768;
-                    pcm_out[i] = (int16_t)val;
-                }
-            }
-            prev_frame_last = pcm_out[out_samples - 1];
+            // Opus already handles frame continuity internally via its overlap-add
+            // windowing. The old quadratic crossfade was redundant and introduced
+            // artifacts (attenuating the first 80 samples of every frame).
             xStreamBufferSend(sb_spk_pcm, pcm_out, out_samples * sizeof(int16_t), pdMS_TO_TICKS(200));
         }
 

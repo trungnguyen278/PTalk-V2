@@ -78,9 +78,8 @@ private:
     std::unique_ptr<AudioCodec>  codec;
     SpiBridge* spi_bridge_ = nullptr;
 
-    // Stream buffers
+    // Stream buffers (sb_mic_encoded removed — MicStream sends directly to SPI)
     StreamBufferHandle_t sb_mic_pcm     = nullptr;
-    StreamBufferHandle_t sb_mic_encoded = nullptr;
     StreamBufferHandle_t sb_spk_pcm     = nullptr;
     StreamBufferHandle_t sb_spk_encoded = nullptr;
 
