@@ -72,7 +72,10 @@ void WebSocketClient::connect()
 
     if (!tx_task) {
         run_tx_task = true;
-        xTaskCreate(&WebSocketClient::wsTxTaskEntry, "ws_tx", 4096, this, 5, &tx_task);
+        // Priority 6 — higher than SPI slave (4) on single-core C5.
+        // When tx_buffer has data, this task preempts SPI to drain frames
+        // over the network, preventing WS write timeout / disconnect.
+        xTaskCreate(&WebSocketClient::wsTxTaskEntry, "ws_tx", 6144, this, 6, &tx_task);
     }
 
     if (status_cb)
@@ -113,8 +116,13 @@ bool WebSocketClient::sendText(const std::string &msg)
     if (!client || !connected)
         return false;
 
-    int sent = esp_websocket_client_send_text(client, msg.c_str(), msg.size(), 100);
-    return sent == msg.size();
+    // Use longer timeout (1s) — text commands like START/END are critical
+    // and must not be dropped due to audio send_bin holding the WS mutex
+    int sent = esp_websocket_client_send_text(client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
+    if (sent != (int)msg.size()) {
+        ESP_LOGW("WebSocketClient", "sendText failed: '%s' (sent=%d)", msg.c_str(), sent);
+    }
+    return sent == (int)msg.size();
 }
 
 bool WebSocketClient::sendBinary(const uint8_t *data, size_t len)
@@ -122,14 +130,34 @@ bool WebSocketClient::sendBinary(const uint8_t *data, size_t len)
     if (!client || !connected || !tx_buffer)
         return false;
 
-    // Push into buffer without blocking (wait=0) to keep SPI task perfectly real-time
-    size_t sent = xStreamBufferSend(tx_buffer, data, len, 0);
-    if (sent < len)
-    {
-        ESP_LOGW(TAG, "WS TX buffer full, dropping frame part (%zu/%zu sent)", sent, len);
+    // Atomic: check space BEFORE writing to prevent partial frames.
+    // A partial [len][opus] write corrupts the stream buffer framing,
+    // causing wsTxLoop to misinterpret data as headers → cascade failure.
+    size_t space = xStreamBufferSpacesAvailable(tx_buffer);
+    if (space < len) {
+        // Drop the entire frame rather than writing partial data
         return false;
     }
-    return true;
+
+    size_t sent = xStreamBufferSend(tx_buffer, data, len, 0);
+    return sent == len;
+}
+
+void WebSocketClient::waitTxDrain(uint32_t timeout_ms)
+{
+    if (!tx_buffer) return;
+
+    uint32_t elapsed = 0;
+    while (elapsed < timeout_ms) {
+        size_t pending = xStreamBufferBytesAvailable(tx_buffer);
+        if (pending == 0) return;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        elapsed += 10;
+    }
+    // Timeout — force flush remaining data
+    ESP_LOGW("WebSocketClient", "TX drain timeout (%lu bytes left), flushing",
+             (unsigned long)xStreamBufferBytesAvailable(tx_buffer));
+    xStreamBufferReset(tx_buffer);
 }
 
 void WebSocketClient::wsTxTaskEntry(void *arg)
@@ -140,44 +168,83 @@ void WebSocketClient::wsTxTaskEntry(void *arg)
 void WebSocketClient::wsTxLoop()
 {
     ESP_LOGI(TAG, "WS TX Task started");
-    uint8_t buf[1024];
+
+    // Batch buffer: accumulate multiple [2B len][opus] frames into one send_bin() call.
+    // At ~80-160 bytes/frame, fits 6-12 frames per batch → 6-12x fewer TCP writes.
+    // Must match WS cfg.buffer_size (8KB) to avoid fragmentation.
+    constexpr size_t BATCH_BUF_SIZE = 2048;
+    uint8_t* buf = (uint8_t*)malloc(BATCH_BUF_SIZE);
+    if (!buf) {
+        ESP_LOGE(TAG, "WS TX: failed to allocate batch buffer");
+        vTaskDelete(nullptr);
+        return;
+    }
+    int consecutive_failures = 0;
 
     while (run_tx_task) {
         if (!connected || !client || !tx_buffer) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            if (tx_buffer && !connected) {
+                xStreamBufferReset(tx_buffer);
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
+        // === Phase 1: Wait for first frame (block up to 20ms) ===
+        size_t batch_len = 0;
         uint8_t header[2];
-        size_t h_got = xStreamBufferReceive(tx_buffer, header, 2, pdMS_TO_TICKS(50));
-        if (h_got < 2) continue; // Not enough data yet
+        size_t h_got = xStreamBufferReceive(tx_buffer, header, 2, pdMS_TO_TICKS(20));
+        if (h_got < 2) continue;
 
         uint16_t frame_len = header[0] | ((uint16_t)header[1] << 8);
-        if (frame_len == 0 || frame_len > sizeof(buf) - 2) {
-            ESP_LOGE(TAG, "WS TX Task: Invalid frame length %u, flushing buffer", frame_len);
+        if (frame_len == 0 || frame_len > 500) {
+            ESP_LOGE(TAG, "WS TX: bad frame len %u, flushing", frame_len);
             xStreamBufferReset(tx_buffer);
             continue;
         }
 
-        // Buffer the header so the server receives the prefixed data
         buf[0] = header[0];
         buf[1] = header[1];
-
-        size_t d_got = xStreamBufferReceive(tx_buffer, buf + 2, frame_len, pdMS_TO_TICKS(100));
+        size_t d_got = xStreamBufferReceive(tx_buffer, buf + 2, frame_len, pdMS_TO_TICKS(20));
         if (d_got < frame_len) {
-            ESP_LOGE(TAG, "WS TX Task: Incomplete payload (%zu/%u), flushing", d_got, frame_len);
+            ESP_LOGE(TAG, "WS TX: incomplete payload (%zu/%u), flushing", d_got, frame_len);
             xStreamBufferReset(tx_buffer);
             continue;
         }
+        batch_len = 2 + frame_len;
 
-        if (connected) {
-            // Send exactly one prefixed Opus frame
-            int sent = esp_websocket_client_send_bin(client, (const char *)buf, frame_len + 2, pdMS_TO_TICKS(2000));
-            if (sent < 0) {
-                ESP_LOGW(TAG, "WS TX Task: send_bin failed");
+        // === Phase 2: Greedily read more available bytes (non-blocking) ===
+        // sendBinary() writes complete [2B len][opus] frames atomically,
+        // so everything in the stream buffer is frame-aligned. Just bulk-read
+        // as much as fits into buf — no per-frame parsing needed here.
+        // The server parses [2B len][opus] boundaries from the WS binary payload.
+        {
+            size_t room = BATCH_BUF_SIZE - batch_len;
+            if (room > 0) {
+                size_t extra = xStreamBufferReceive(tx_buffer, buf + batch_len, room, 0);
+                batch_len += extra;
             }
         }
+
+        if (!connected || batch_len == 0) continue;
+
+        // === Phase 3: Send entire batch in one TCP write ===
+        int sent = esp_websocket_client_send_bin(client, (const char *)buf, batch_len, pdMS_TO_TICKS(200));
+        if (sent < 0) {
+            consecutive_failures++;
+            if (consecutive_failures <= 3) {
+                ESP_LOGW(TAG, "WS TX: send_bin failed (%d), batch=%zu bytes", consecutive_failures, batch_len);
+            }
+            if (consecutive_failures >= 5) {
+                ESP_LOGW(TAG, "WS TX: %d consecutive failures, flushing buffer", consecutive_failures);
+                xStreamBufferReset(tx_buffer);
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+        } else {
+            consecutive_failures = 0;
+        }
     }
+    free(buf);
     ESP_LOGI(TAG, "WS TX Task stopped");
     vTaskDelete(nullptr);
 }
@@ -242,6 +309,7 @@ void WebSocketClient::eventHandler(esp_event_base_t base, int32_t event_id,
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "WS disconnected");
         connected = false;
+        if (tx_buffer) xStreamBufferReset(tx_buffer);  // Flush stale audio
         if (status_cb)
             status_cb(0);
         break;
@@ -249,6 +317,7 @@ void WebSocketClient::eventHandler(esp_event_base_t base, int32_t event_id,
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "WS error event");
         connected = false;
+        if (tx_buffer) xStreamBufferReset(tx_buffer);  // Flush stale audio
         if (status_cb)
             status_cb(0);
         break;

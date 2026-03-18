@@ -36,6 +36,14 @@ public:
     bool sendText(const std::string& msg);
     bool sendBinary(const uint8_t* data, size_t len);
 
+    // Wait for TX buffer to drain (up to timeout_ms). Used before sending END.
+    void waitTxDrain(uint32_t timeout_ms = 500);
+
+    // Returns free space in TX buffer (bytes). Used for SPI flow control.
+    size_t getTxFreeSpace() const {
+        return tx_buffer ? xStreamBufferSpacesAvailable(tx_buffer) : 0;
+    }
+
     // Callbacks
     void onStatus(std::function<void(int)> cb);   // 0=closed,1=connecting,2=open
     void onText(std::function<void(const std::string&)> cb);

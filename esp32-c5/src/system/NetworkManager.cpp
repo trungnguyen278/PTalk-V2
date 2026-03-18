@@ -107,21 +107,10 @@ void NetworkManager::setupWebSocket()
             StateManager::instance().setConnectivityState(state::ConnectivityState::ONLINE);
             sendDeviceHandshake();
 
-            // Lazy MQTT
-            if (!mqtt_ && !cfg_.mqtt_url.empty()) {
-                size_t free_heap = esp_get_free_heap_size();
-                if (free_heap > 20000) {
-                    ESP_LOGI(TAG, "Lazy MQTT init (free heap: %lu)", (unsigned long)free_heap);
-                    mqtt_ = std::make_unique<MqttClient>();
-                    mqtt_->init();
-                    setupMqtt();
-                    mqtt_->setUri(cfg_.mqtt_url);
-                    std::string user = cfg_.user_id.empty() ? std::string(getDeviceEfuseID()) : cfg_.user_id;
-                    mqtt_->setCredentials(user, cfg_.tx_key);
-                    mqtt_->start();
-                } else {
-                    ESP_LOGW(TAG, "MQTT skipped - low heap (%lu)", (unsigned long)free_heap);
-                }
+            // Deferred MQTT: start in a background task after 10s delay
+            // so the TCP connect attempt doesn't disrupt the WS connection
+            if (!mqtt_ && !cfg_.mqtt_url.empty() && !mqtt_init_pending_) {
+                startMqttDeferred();
             }
             break;
 
@@ -172,15 +161,23 @@ void NetworkManager::setupWebSocket()
         }
     });
 
-    // Server binary -> relay to S3 via SPI audio downlink
-    // Data from server is length-prefixed Opus frames: [2-byte LE len][opus data]...
-    // Each SPI frame can carry MAX_PAYLOAD(250) bytes. We must send complete
-    // [len][opus] frames and never split a frame across SPI transactions.
+    // Server binary -> relay raw bytes to S3 via SPI audio downlink stream.
+    // Data is concatenated [2-byte LE len][opus data] frames. We do NOT parse
+    // frames here — just push raw bytes into SpiBridge's stream buffer.
+    // The SPI slave loop sends MAX_PAYLOAD-sized chunks, and S3 writes them
+    // into its own stream buffer. AudioRecv on S3 parses [2B len][opus] from
+    // the stream buffer, which handles frame boundaries transparently.
+    // This fixes: frames >250 bytes, frames split across WS messages.
     ws_->onBinary([this](const uint8_t* data, size_t len) {
         if (!data || len == 0 || !spi_bridge_) return;
 
+        static uint32_t bin_msg_count = 0;
+        bin_msg_count++;
+        if (bin_msg_count == 1 || bin_msg_count % 100 == 0) {
+            ESP_LOGI(TAG, "WS binary #%lu: %zu bytes", (unsigned long)bin_msg_count, len);
+        }
+
         // Auto-start speaking session if binary arrives during PROCESSING
-        // (server may send audio before explicit AUDIO_START text)
         if (!speaking_session_active_) {
             auto state = StateManager::instance().getInteractionState();
             if (state == state::InteractionState::PROCESSING ||
@@ -189,31 +186,12 @@ void NetworkManager::setupWebSocket()
                 StateManager::instance().setInteractionState(
                     state::InteractionState::SPEAKING, state::InputSource::SERVER_COMMAND);
             } else {
-                return;  // Not in a state where audio should play
+                return;
             }
         }
 
-        size_t offset = 0;
-        while (offset + 2 <= len) {
-            uint16_t frame_len = data[offset] | ((uint16_t)data[offset + 1] << 8);
-            size_t total = 2 + frame_len;
-
-            // Validate frame
-            if (frame_len == 0 || frame_len > 500 || offset + total > len) {
-                ESP_LOGW(TAG, "WS binary: bad frame at offset %zu (frame_len=%u, remaining=%zu)",
-                         offset, frame_len, len - offset);
-                break;
-            }
-
-            // Each complete [len][opus] frame must fit in one SPI payload
-            if (total <= spi_proto::MAX_PAYLOAD) {
-                spi_bridge_->sendAudioDownlink(data + offset, total);
-            } else {
-                ESP_LOGW(TAG, "WS binary: frame too large for SPI (%zu > %zu)", total, spi_proto::MAX_PAYLOAD);
-            }
-
-            offset += total;
-        }
+        // Push raw bytes — no frame parsing, no MAX_PAYLOAD limit
+        spi_bridge_->sendAudioDownlink(data, len);
     });
 }
 
@@ -239,13 +217,9 @@ void NetworkManager::setupMqtt()
 
             if (cmd == "set_volume") {
                 cJSON* vol = cJSON_GetObjectItem(root, "volume");
-                if (vol && cJSON_IsNumber(vol) && spi_bridge_) {
+                if (vol && cJSON_IsNumber(vol)) {
                     uint8_t v = (uint8_t)vol->valueint;
-                    spi_bridge_->sendStatusUpdate(
-                        (uint8_t)StateManager::instance().getInteractionState(),
-                        (uint8_t)StateManager::instance().getConnectivityState(),
-                        (uint8_t)StateManager::instance().getSystemState(),
-                        (uint8_t)StateManager::instance().getEmotionState());
+                    ESP_LOGI(TAG, "MQTT set_volume: %d (relay to S3 via UART TODO)", v);
                 }
             } else if (cmd == "reboot") {
                 esp_restart();
@@ -277,6 +251,16 @@ void NetworkManager::sendBinary(const uint8_t* data, size_t len)
     if (ws_ && ws_connected_) ws_->sendBinary(data, len);
 }
 
+void NetworkManager::waitTxDrain(uint32_t timeout_ms)
+{
+    if (ws_) ws_->waitTxDrain(timeout_ms);
+}
+
+size_t NetworkManager::getWsTxFreeSpace() const
+{
+    return ws_ ? ws_->getTxFreeSpace() : 0;
+}
+
 void NetworkManager::setWSImmuneMode(bool enable) { ws_immune_ = enable; }
 
 void NetworkManager::sendDeviceHandshake()
@@ -287,6 +271,56 @@ void NetworkManager::sendDeviceHandshake()
         "\"firmware_version\":\"%s\",\"device_name\":\"%s\"}",
         getDeviceEfuseID(), app_meta::APP_VERSION, app_meta::DEVICE_MODEL);
     sendText(buf);
+}
+
+// === Deferred MQTT init ===
+
+void NetworkManager::startMqttDeferred()
+{
+    mqtt_init_pending_ = true;
+    // One-shot task: waits 10s for WS to stabilize, then starts MQTT.
+    // Runs on Core 0 at low priority so it doesn't interfere with WS or SPI.
+    xTaskCreatePinnedToCore(&NetworkManager::mqttInitTaskEntry, "mqtt_init",
+                            3072, this, 1, nullptr, 0);
+}
+
+void NetworkManager::mqttInitTaskEntry(void* arg)
+{
+    auto* self = static_cast<NetworkManager*>(arg);
+
+    // Wait 10s — let WS connection fully stabilize
+    vTaskDelay(pdMS_TO_TICKS(10000));
+
+    // Only proceed if WS is still connected and MQTT wasn't started yet
+    if (!self->ws_connected_ || self->mqtt_) {
+        ESP_LOGI(TAG, "MQTT deferred init cancelled (ws=%d mqtt=%d)",
+                 (int)self->ws_connected_, self->mqtt_ != nullptr);
+        self->mqtt_init_pending_ = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    size_t free_heap = esp_get_free_heap_size();
+    if (free_heap < 20000) {
+        ESP_LOGW(TAG, "MQTT skipped - low heap (%lu)", (unsigned long)free_heap);
+        self->mqtt_init_pending_ = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Deferred MQTT init (free heap: %lu)", (unsigned long)free_heap);
+    self->mqtt_ = std::make_unique<MqttClient>();
+    self->mqtt_->init();
+    self->setupMqtt();
+    self->mqtt_->setUri(self->cfg_.mqtt_url);
+    std::string user = self->cfg_.user_id.empty()
+                           ? std::string(getDeviceEfuseID())
+                           : self->cfg_.user_id;
+    self->mqtt_->setCredentials(user, self->cfg_.tx_key);
+    self->mqtt_->start();
+
+    self->mqtt_init_pending_ = false;
+    vTaskDelete(nullptr);
 }
 
 // === Emotion parsing ===

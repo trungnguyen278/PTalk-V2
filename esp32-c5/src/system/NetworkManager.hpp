@@ -43,6 +43,8 @@ public:
     // WebSocket control
     void sendText(const std::string& msg);
     void sendBinary(const uint8_t* data, size_t len);
+    void waitTxDrain(uint32_t timeout_ms = 500);
+    size_t getWsTxFreeSpace() const;
     void setWSImmuneMode(bool enable);
 
     // Speaking session tracking
@@ -58,6 +60,8 @@ private:
     void setupWebSocket();
     void setupMqtt();
     void sendDeviceHandshake();
+    void startMqttDeferred();
+    static void mqttInitTaskEntry(void* arg);
 
     Config cfg_;
 
@@ -70,4 +74,5 @@ private:
     std::atomic<bool> ws_connected_{false};
     std::atomic<bool> ws_immune_{false};
     std::atomic<bool> speaking_session_active_{false};
+    std::atomic<bool> mqtt_init_pending_{false};
 };

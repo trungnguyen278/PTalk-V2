@@ -76,10 +76,12 @@ void MqttClient::start()
     cfg.session.keepalive = 60;
     cfg.session.disable_keepalive = false;
 
-    // Network
-    cfg.network.disable_auto_reconnect = false;
-    cfg.network.reconnect_timeout_ms = 5000;
-    cfg.network.timeout_ms = 5000;  // Short connect timeout (default 10s blocks esp-tls)
+    // Network — disable auto-reconnect entirely. Each failed connect blocks
+    // the TCP/lwIP stack for timeout_ms, which can cause WS transport_poll_write
+    // to fail → WS disconnects. Let NetworkManager handle retry if needed.
+    cfg.network.disable_auto_reconnect = true;
+    cfg.network.reconnect_timeout_ms = 60000;
+    cfg.network.timeout_ms = 3000;  // 3s connect timeout (fail fast)
 
     // Buffer
     cfg.buffer.size = 512;
