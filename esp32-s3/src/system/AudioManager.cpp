@@ -276,7 +276,7 @@ void AudioManager::audioRecvLoop()
 
     const size_t pcm_frame = codec->pcmFrameSamples();
     constexpr size_t ENC_PREBUF = 2000;
-    uint8_t* frame_data = new uint8_t[512];
+    uint8_t* frame_data = new uint8_t[1024];  // Server may send frames >500B at higher bitrates
     int16_t* pcm_out = new int16_t[pcm_frame];
     bool new_session = true;
     bool enc_prebuffered = false;
@@ -303,21 +303,48 @@ void AudioManager::audioRecvLoop()
             ESP_LOGI(TAG, "AudioRecv: encoded pre-buffer ready (%zu bytes)", enc_avail);
         }
 
+        // Read 2-byte header. With raw byte streaming from SPI, header bytes
+        // may arrive across two SPI chunks, so accumulate with a loop.
         uint8_t header[2];
-        size_t got = xStreamBufferReceive(sb_spk_encoded, header, 2, pdMS_TO_TICKS(20));
-        if (got < 2) continue;
+        size_t h_got = 0;
+        TickType_t h_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(100);
+        while (h_got < 2) {
+            TickType_t now = xTaskGetTickCount();
+            if (now >= h_deadline) break;
+            size_t r = xStreamBufferReceive(sb_spk_encoded, header + h_got, 2 - h_got, h_deadline - now);
+            if (r == 0) break;
+            h_got += r;
+        }
+        if (h_got < 2) continue;
 
         uint16_t frame_len = header[0] | ((uint16_t)header[1] << 8);
-        if (frame_len == 0 || frame_len > 500) {
-            ESP_LOGE(TAG, "AudioRecv: bad frame len %u, resetting", frame_len);
-            xStreamBufferReset(sb_spk_encoded);
+        if (frame_len == 0 || frame_len > 960) {
+            // Bad frame length — likely stream corruption. Skip this header pair.
+            ESP_LOGE(TAG, "AudioRecv: bad frame len %u, skipping", frame_len);
+            // Put header[1] back as potential start of next header by treating
+            // header[0] as junk. Read one more byte into header[0] and retry.
+            // Since stream buffer can't "unread", just skip this pair and
+            // hope the next 2 bytes form a valid header.
             continue;
         }
 
-        size_t data_got = xStreamBufferReceive(sb_spk_encoded, frame_data, frame_len, pdMS_TO_TICKS(50));
+        // Read payload — loop until we get all bytes or timeout.
+        // With raw SPI streaming, payload may arrive across multiple SPI
+        // transactions (each delivering up to 250 bytes every few ms).
+        size_t data_got = 0;
+        TickType_t d_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(500);
+        while (data_got < frame_len) {
+            TickType_t now = xTaskGetTickCount();
+            if (now >= d_deadline) break;
+            size_t r = xStreamBufferReceive(sb_spk_encoded, frame_data + data_got,
+                                             frame_len - data_got, d_deadline - now);
+            if (r == 0) break;
+            data_got += r;
+        }
         if (data_got < frame_len) {
-            ESP_LOGW(TAG, "AudioRecv: incomplete frame (%zu/%u), resetting", data_got, frame_len);
-            xStreamBufferReset(sb_spk_encoded);
+            // Incomplete frame — DON'T reset buffer! The remaining bytes are
+            // valid data for subsequent frames. Just discard this partial frame.
+            ESP_LOGW(TAG, "AudioRecv: incomplete frame (%zu/%u), discarding", data_got, frame_len);
             continue;
         }
 
