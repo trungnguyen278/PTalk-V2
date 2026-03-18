@@ -83,7 +83,9 @@ size_t I2SAudioOutput_MAX98357::writePcm(const int16_t* pcm, size_t pcm_samples)
     size_t count = (pcm_samples > 512) ? 512 : pcm_samples;
 
     for (size_t i = 0; i < count; ++i) {
-        int32_t scaled = ((int32_t)pcm[i] * volume_) / 100;
+        // Use fixed-point multiply with rounding to reduce quantization noise.
+        // vol_scale = volume * 327 ≈ volume * 32768/100 (Q15 fraction)
+        int32_t scaled = ((int32_t)pcm[i] * (int32_t)(volume_ * 327)) >> 15;
         out_buf[i] = scaled << 16;
     }
 
