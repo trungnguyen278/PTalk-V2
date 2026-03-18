@@ -294,12 +294,11 @@ bool DeviceProfile::setup(AppController& app)
             sm.setInteractionState(state::InteractionState::SPEAKING, state::InputSource::SERVER_COMMAND);
         }
 
-        // Write raw bytes — no frame validation needed here.
-        // AudioRecv reads [2B len][opus] boundaries from the stream buffer.
+        // All-or-nothing: partial writes break [2B len][opus] stream alignment.
+        // Dropping a full SPI chunk is safe — Opus PLC handles gaps gracefully.
         size_t space = xStreamBufferSpacesAvailable(spk_sb);
-        size_t to_write = (len <= space) ? len : space;
-        if (to_write > 0) {
-            xStreamBufferSend(spk_sb, data, to_write, 0);
+        if (space >= len) {
+            xStreamBufferSend(spk_sb, data, len, 0);
         }
     });
 

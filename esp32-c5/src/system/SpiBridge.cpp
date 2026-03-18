@@ -100,18 +100,27 @@ bool SpiBridge::sendAudioDownlink(const uint8_t* data, size_t len)
 {
     if (!dl_audio_sb_ || len == 0) return false;
 
-    // Push raw bytes into stream buffer — no frame parsing, no size limit.
-    // The slave loop reads up to MAX_PAYLOAD bytes per SPI transaction.
-    // S3 writes received chunks into its stream buffer; AudioRecv parses
-    // [2B len][opus] frame boundaries from the stream transparently.
-    size_t sent = xStreamBufferSend(dl_audio_sb_, data, len, 0);
-    if (sent < len) {
-        ESP_LOGW(TAG, "DL audio buffer full, dropped %zu/%zu bytes", len - sent, len);
+    // All-or-nothing: either write ALL bytes or NONE.
+    // A partial write breaks the [2B len][opus] byte stream alignment
+    // permanently — S3 reads garbage headers → cascade decode errors.
+    // Dropping an entire WS message is safe: Opus handles packet loss
+    // gracefully (PLC), but corrupted frames cause audible artifacts.
+    size_t space = xStreamBufferSpacesAvailable(dl_audio_sb_);
+    if (space < len) {
+        static uint32_t drop_count = 0;
+        drop_count++;
+        if (drop_count <= 5 || drop_count % 50 == 0) {
+            ESP_LOGW(TAG, "DL audio buffer full, dropped %zu bytes (space=%zu) #%lu",
+                     len, space, (unsigned long)drop_count);
+        }
+        return false;
     }
+
+    size_t sent = xStreamBufferSend(dl_audio_sb_, data, len, 0);
     if (sent > 0) {
         gpio_set_level(cfg_.pin_handshake, 1);
     }
-    return sent > 0;
+    return sent == len;
 }
 
 void SpiBridge::handleRxFrame(const uint8_t* rx_buf)
