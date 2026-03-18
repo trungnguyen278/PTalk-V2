@@ -4,10 +4,23 @@
 
 static const char* TAG = "SpiBridge";
 
+// Static handshake pin for SPI slave post_setup callback.
+// Set HIGH after DMA is loaded, so master sees handshake only when slave is ready.
+static gpio_num_t s_handshake_pin = GPIO_NUM_NC;
+static bool s_handshake_pending = false;
+
+static void IRAM_ATTR spi_post_setup_cb(spi_slave_transaction_t* trans)
+{
+    // Set handshake to accurately reflect data availability.
+    // HIGH = this frame has real data OR more data waiting.
+    // LOW = sending EMPTY and nothing else queued.
+    // This fires AFTER DMA is loaded, so master won't clock garbage.
+    gpio_set_level(s_handshake_pin, s_handshake_pending ? 1 : 0);
+}
+
 SpiBridge::~SpiBridge()
 {
     stop();
-    if (ctrl_queue_)  { vQueueDelete(ctrl_queue_); ctrl_queue_ = nullptr; }
     if (dl_audio_sb_) { vStreamBufferDelete(dl_audio_sb_); dl_audio_sb_ = nullptr; }
 }
 
@@ -33,11 +46,14 @@ bool SpiBridge::init(const Config& cfg)
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = spi_proto::FRAME_SIZE;
 
+    s_handshake_pin = cfg_.pin_handshake;
+
     spi_slave_interface_config_t slave_cfg = {};
     slave_cfg.mode = 0;
     slave_cfg.spics_io_num = cfg_.pin_cs;
     slave_cfg.queue_size = 1;
     slave_cfg.flags = 0;
+    slave_cfg.post_setup_cb = spi_post_setup_cb;
 
     esp_err_t err = spi_slave_initialize(SPI2_HOST, &bus_cfg, &slave_cfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK) {
@@ -54,13 +70,6 @@ bool SpiBridge::init(const Config& cfg)
         return false;
     }
 
-    // Control/status queue: small, only for STATUS_UPDATE messages
-    ctrl_queue_ = xQueueCreate(4, spi_proto::FRAME_SIZE);
-    if (!ctrl_queue_) {
-        ESP_LOGE(TAG, "Ctrl queue create failed");
-        return false;
-    }
-
     ESP_LOGI(TAG, "SpiBridge init OK (MOSI=%d MISO=%d SCLK=%d CS=%d HS=%d)",
              cfg_.pin_mosi, cfg_.pin_miso, cfg_.pin_sclk, cfg_.pin_cs,
              cfg_.pin_handshake);
@@ -72,7 +81,9 @@ void SpiBridge::start()
     if (started_) return;
     started_ = true;
 
-    xTaskCreatePinnedToCore(&SpiBridge::slaveTaskEntry, "SpiBridge", 4096, this, 5, &slave_task_, 0);
+    // Priority 4 — lower than WS TX task (6) so on single-core C5,
+    // WS sends preempt SPI when tx_buffer has data to drain.
+    xTaskCreatePinnedToCore(&SpiBridge::slaveTaskEntry, "SpiBridge", 4096, this, 4, &slave_task_, 0);
     ESP_LOGI(TAG, "SpiBridge started");
 }
 
@@ -87,44 +98,20 @@ void SpiBridge::stop()
 
 bool SpiBridge::sendAudioDownlink(const uint8_t* data, size_t len)
 {
-    if (!dl_audio_sb_ || len == 0 || len > spi_proto::MAX_PAYLOAD) return false;
+    if (!dl_audio_sb_ || len == 0) return false;
 
-    // Push raw [len][opus] frame into stream buffer — non-blocking
+    // Push raw bytes into stream buffer — no frame parsing, no size limit.
+    // The slave loop reads up to MAX_PAYLOAD bytes per SPI transaction.
+    // S3 writes received chunks into its stream buffer; AudioRecv parses
+    // [2B len][opus] frame boundaries from the stream transparently.
     size_t sent = xStreamBufferSend(dl_audio_sb_, data, len, 0);
     if (sent < len) {
-        ESP_LOGW(TAG, "DL audio buffer full, frame dropped (%zu/%zu)", sent, len);
-        return false;
+        ESP_LOGW(TAG, "DL audio buffer full, dropped %zu/%zu bytes", len - sent, len);
     }
-    // Signal master that we have data
-    gpio_set_level(cfg_.pin_handshake, 1);
-    return true;
-}
-
-bool SpiBridge::sendStatusUpdate(uint8_t interaction, uint8_t connectivity,
-                                  uint8_t system_state, uint8_t emotion)
-{
-    if (!ctrl_queue_) return false;
-
-    spi_proto::StatusPayload sp;
-    sp.interaction = interaction;
-    sp.connectivity = connectivity;
-    sp.system_state = system_state;
-    sp.emotion = emotion;
-
-    uint8_t frame[spi_proto::FRAME_SIZE];
-    spi_proto::buildFrame(frame, (uint8_t)spi_proto::MsgFromC5::STATUS_UPDATE,
-                          (const uint8_t*)&sp, sizeof(sp), tx_seq_++);
-
-    bool ok = xQueueSend(ctrl_queue_, frame, 0) == pdTRUE;
-    updateHandshake();
-    return ok;
-}
-
-void SpiBridge::updateHandshake()
-{
-    bool has_data = (dl_audio_sb_ && xStreamBufferBytesAvailable(dl_audio_sb_) > 0) ||
-                    (ctrl_queue_ && uxQueueMessagesWaiting(ctrl_queue_) > 0);
-    gpio_set_level(cfg_.pin_handshake, has_data ? 1 : 0);
+    if (sent > 0) {
+        gpio_set_level(cfg_.pin_handshake, 1);
+    }
+    return sent > 0;
 }
 
 void SpiBridge::handleRxFrame(const uint8_t* rx_buf)
@@ -142,57 +129,48 @@ void SpiBridge::handleRxFrame(const uint8_t* rx_buf)
         if (audio_ul_cb_ && payload_len > 0) {
             audio_ul_cb_(payload, payload_len);
         }
-    } else if (msg_type == (uint8_t)spi_proto::MsgFromS3::CONTROL_CMD) {
-        if (control_cb_ && payload_len >= 1) {
-            auto cmd = static_cast<spi_proto::ControlCmd>(payload[0]);
-            control_cb_(cmd, &payload[1], payload_len - 1);
-        }
     }
-    // HEARTBEAT: no action needed (just polls for C5 response)
+    // HEARTBEAT and CONTROL_CMD: no action needed
+    // (control commands now go through UART)
 }
 
 // === Prepare next TX frame ===
-// Priority: control/status > audio downlink > EMPTY
-bool SpiBridge::prepareTxFrame(uint8_t* tx_buf)
+// Always produces a frame (real data or EMPTY). Called once per iteration.
+// Audio downlink is raw byte streaming — no frame parsing here.
+void SpiBridge::prepareTxFrame(uint8_t* tx_buf)
 {
-    // 1. Control/status messages first (rare but important)
-    if (ctrl_queue_ && uxQueueMessagesWaiting(ctrl_queue_) > 0) {
-        xQueueReceive(ctrl_queue_, tx_buf, 0);
-        return true;
-    }
-
-    // 2. Audio downlink: read one complete [2B len][opus] frame from stream buffer
-    if (dl_audio_sb_ && xStreamBufferBytesAvailable(dl_audio_sb_) >= 3) {
-        uint8_t header[2];
-        size_t got = xStreamBufferReceive(dl_audio_sb_, header, 2, 0);
-        if (got == 2) {
-            uint16_t frame_len = header[0] | ((uint16_t)header[1] << 8);
-            if (frame_len > 0 && frame_len <= 500 && (size_t)(2 + frame_len) <= spi_proto::MAX_PAYLOAD) {
-                // Build payload: [2B len][opus data]
-                uint8_t payload[spi_proto::MAX_PAYLOAD];
-                payload[0] = header[0];
-                payload[1] = header[1];
-                size_t data_got = xStreamBufferReceive(dl_audio_sb_, &payload[2], frame_len, 0);
-                if (data_got == frame_len) {
-                    spi_proto::buildFrame(tx_buf, (uint8_t)spi_proto::MsgFromC5::AUDIO_DOWNLINK,
-                                          payload, (uint16_t)(2 + frame_len), tx_seq_++);
-                    return true;
-                } else {
-                    // Incomplete frame in stream buffer — discard and reset
-                    ESP_LOGW(TAG, "DL audio: incomplete frame (%zu/%u), flushing", data_got, frame_len);
-                    xStreamBufferReset(dl_audio_sb_);
+    // 1. Audio downlink: read up to MAX_PAYLOAD raw bytes from stream buffer.
+    //    No frame alignment — S3 reassembles [2B len][opus] from its stream buffer.
+    if (dl_audio_sb_) {
+        size_t avail = xStreamBufferBytesAvailable(dl_audio_sb_);
+        if (avail > 0) {
+            uint8_t payload[spi_proto::MAX_PAYLOAD];
+            size_t to_read = (avail > spi_proto::MAX_PAYLOAD) ? spi_proto::MAX_PAYLOAD : avail;
+            size_t got = xStreamBufferReceive(dl_audio_sb_, payload, to_read, 0);
+            if (got > 0) {
+                static uint32_t dl_tx_count = 0;
+                dl_tx_count++;
+                if (dl_tx_count == 1 || dl_tx_count % 200 == 0) {
+                    ESP_LOGI(TAG, "TX AUDIO_DL #%lu: %zu bytes (avail=%zu)",
+                             (unsigned long)dl_tx_count, got, avail);
                 }
-            } else {
-                // Bad frame length — stream is corrupted, reset
-                ESP_LOGW(TAG, "DL audio: bad frame len %u, flushing", frame_len);
-                xStreamBufferReset(dl_audio_sb_);
+                spi_proto::buildFrame(tx_buf, (uint8_t)spi_proto::MsgFromC5::AUDIO_DOWNLINK,
+                                      payload, (uint16_t)got, tx_seq_++);
+                return;
             }
         }
     }
 
-    // 3. Nothing to send
-    spi_proto::buildEmptyFrame(tx_buf, tx_seq_++);
-    return false;
+    // 2. Nothing to send — include WS tx_buffer free space for S3 flow control.
+    if (ul_space_query_) {
+        size_t free_bytes = ul_space_query_();
+        uint8_t free_kb = (uint8_t)(free_bytes / 1024);
+        if (free_kb > 255) free_kb = 255;
+        spi_proto::buildFrame(tx_buf, (uint8_t)spi_proto::MsgFromC5::EMPTY,
+                              &free_kb, 1, tx_seq_++);
+    } else {
+        spi_proto::buildEmptyFrame(tx_buf, tx_seq_++);
+    }
 }
 
 // === Slave Task ===
@@ -219,23 +197,40 @@ void SpiBridge::slaveLoop()
     }
 
     while (started_) {
-        // Prepare TX frame from stream buffer / ctrl queue
+        // Prepare TX frame: control/status > audio downlink > EMPTY
         prepareTxFrame(tx_buf);
 
-        // Update handshake: HIGH if more data waiting after this frame
-        updateHandshake();
+        // Tell post_setup_cb whether to raise handshake after DMA is loaded.
+        // The callback fires inside spi_slave_transmit, AFTER DMA registers
+        // are configured but BEFORE the master clocks — eliminating the race
+        // where master sees handshake HIGH but slave DMA isn't ready yet.
+        s_handshake_pending =
+            (dl_audio_sb_ && xStreamBufferBytesAvailable(dl_audio_sb_) > 0);
 
-        // Queue slave transaction and wait for master
         spi_slave_transaction_t t = {};
         t.length = spi_proto::FRAME_SIZE * 8;
         t.tx_buffer = tx_buf;
         t.rx_buffer = rx_buf;
 
-        esp_err_t err = spi_slave_transmit(SPI2_HOST, &t, pdMS_TO_TICKS(100));
+        // Block forever — no timeout. This prevents stale transactions from
+        // piling up in the hardware queue (size=1). When timeout was used,
+        // the timed-out transaction stayed pending, blocking the next call
+        // and causing cascading deadlocks.
+        // Producer (sendAudioDownlink) sets handshake HIGH
+        // to wake S3, which polls and completes this transaction.
+        // S3 also polls when it has uplink data (audio/control).
+        esp_err_t err = spi_slave_transmit(SPI2_HOST, &t, portMAX_DELAY);
         if (err == ESP_OK) {
             handleRxFrame(rx_buf);
+
+            // Pull handshake LOW after transaction. post_setup_cb will raise
+            // it HIGH again on the next iteration when DMA is loaded.
+            gpio_set_level(cfg_.pin_handshake, 0);
+
+            // CRITICAL on single-core C5: yield after every transaction so the
+            // WS TX task (same priority) can drain the tx_buffer and send data.
+            taskYIELD();
         }
-        // ESP_ERR_TIMEOUT is normal when master hasn't initiated a transaction
     }
 
     free(tx_buf);
