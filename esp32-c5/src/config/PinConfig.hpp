@@ -3,38 +3,28 @@
 // =============================================================================
 // PTalk V2 - ESP32-C5 Pin Configuration
 // =============================================================================
-// ESP32-C5 has GPIO0-GPIO14 available
-// Adjust these pins to match your PCB layout
+// ESP32-C5 has GPIO0-GPIO14 available.
+// Responsibilities: WiFi, WebSocket, MQTT, SPI slave bridge to S3
+// Audio, button, and display are now on S3.
 // =============================================================================
 
 namespace PinConfig {
 
-// --- I2S Audio ---
-// ESP32-C5 chỉ có 1 I2S port → full-duplex bắt buộc shared BCLK/WS
-// Mic (ICS43434)
-static constexpr int MIC_BCLK  = 2;   // ICS43434 SCK  (shared with SPK)
-static constexpr int MIC_WS    = 3;   // ICS43434 WS   (shared with SPK)
-static constexpr int MIC_DOUT  = 4;   // ICS43434 SD   (mic data out → C5 data in)
+// --- SPI Slave (S3=Master, C5=Slave) ---
+static constexpr int SPI_MOSI      = 2;   // C5 GPIO2  <- S3 GPIO35  (MOSI)
+static constexpr int SPI_MISO      = 3;   // C5 GPIO3  -> S3 GPIO36  (MISO)
+static constexpr int SPI_SCLK      = 4;   // C5 GPIO4  <- S3 GPIO37  (SCLK)
+static constexpr int SPI_CS        = 5;   // C5 GPIO5  <- S3 GPIO38  (CS)
+static constexpr int SPI_HANDSHAKE = 8;   // C5 GPIO8  -> S3 GPIO39  (HIGH = C5 has data)
 
-// Speaker (MAX98357)
-static constexpr int SPK_BCLK  = 2;   // MAX98357 BCLK (shared with MIC)
-static constexpr int SPK_WS    = 3;   // MAX98357 LRC  (shared with MIC)
-static constexpr int SPK_DIN   = 5;   // MAX98357 DIN  (C5 data out → speaker)
-static constexpr int SPK_SD    = 9;   // MAX98357 SD   (shutdown: LOW=off, HIGH=on)
-static constexpr int SPK_GAIN  = 10;  // MAX98357 GAIN (LOW=15dB, float=9dB, HIGH=12dB)
+// --- SPI Configuration ---
+static constexpr int SPI_NUM       = 2;   // SPI2
 
-// --- UART (Communication with ESP32-S3) ---
-static constexpr int UART_TX   = 6;   // C5 TX -> S3 RX
-static constexpr int UART_RX   = 7;   // C5 RX <- S3 TX
+// --- UART Bridge to S3 (control/status messages) ---
+static constexpr int UART_TX       = 6;   // C5 GPIO6  -> S3 GPIO17  (RX)
+static constexpr int UART_RX       = 7;   // C5 GPIO7  <- S3 GPIO18  (TX)
 
-// --- Button ---
-static constexpr int BUTTON    = 8;   // Push button (active low, pull-up)
-
-// --- UART Configuration ---
-static constexpr int UART_NUM       = 1;       // UART1
-static constexpr int UART_BAUD_RATE = 115200;
-
-// --- I2S Configuration ---
-static constexpr int I2S_NUM        = 0;       // I2S0 (only 1 on C5)
+// --- Free GPIOs ---
+// GPIO 9, 10 are available for future use
 
 } // namespace PinConfig

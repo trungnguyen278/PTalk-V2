@@ -4,6 +4,9 @@
 #include <functional>
 #include <vector>
 #include "esp_websocket_client.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/stream_buffer.h"
 
 /**
  * WebSocketClient
@@ -33,6 +36,14 @@ public:
     bool sendText(const std::string& msg);
     bool sendBinary(const uint8_t* data, size_t len);
 
+    // Wait for TX buffer to drain (up to timeout_ms). Used before sending END.
+    void waitTxDrain(uint32_t timeout_ms = 500);
+
+    // Returns free space in TX buffer (bytes). Used for SPI flow control.
+    size_t getTxFreeSpace() const {
+        return tx_buffer ? xStreamBufferSpacesAvailable(tx_buffer) : 0;
+    }
+
     // Callbacks
     void onStatus(std::function<void(int)> cb);   // 0=closed,1=connecting,2=open
     void onText(std::function<void(const std::string&)> cb);
@@ -41,6 +52,9 @@ public:
 private:
     static void eventHandlerStatic(void* handler_args, esp_event_base_t base,
                                    int32_t event_id, void* event_data);
+
+    static void wsTxTaskEntry(void* arg);
+    void wsTxLoop();
 
     void eventHandler(esp_event_base_t base, int32_t event_id,
                       esp_websocket_event_data_t* data);
@@ -56,4 +70,8 @@ private:
     std::function<void(int)> status_cb;               // status
     std::function<void(const std::string&)> text_cb;  // text message
     std::function<void(const uint8_t*, size_t)> binary_cb; // binary message
+
+    StreamBufferHandle_t tx_buffer = nullptr;
+    TaskHandle_t tx_task = nullptr;
+    bool run_tx_task = false;
 };

@@ -10,6 +10,8 @@
 
 namespace event {
     enum class AppEvent : uint8_t {
+        USER_BUTTON,
+        RELEASE_BUTTON,
         SLEEP_REQUEST,
         WAKE_REQUEST,
         REBOOT_REQUEST
@@ -18,10 +20,13 @@ namespace event {
 
 class DisplayManager;
 class PowerManager;
+class AudioManager;
+class SpiBridge;
 class UartBridge;
+class TouchInput;
 
-// AppController for ESP32-S3: manages Display, Power, UART bridge.
-// No audio, no network, no BLE (those are on C5).
+// AppController for ESP32-S3: orchestrates Display, Power, Audio, SPI Bridge, Touch.
+// S3 now owns audio + button. Interaction state is managed here and sent to C5 via SPI.
 class AppController {
 public:
     static AppController& instance();
@@ -35,7 +40,10 @@ public:
 
     void attachModules(std::unique_ptr<DisplayManager> displayIn,
                        std::unique_ptr<PowerManager> powerIn,
-                       std::unique_ptr<UartBridge> uartIn);
+                       std::unique_ptr<AudioManager> audioIn,
+                       std::unique_ptr<SpiBridge> spiIn,
+                       std::unique_ptr<UartBridge> uartIn,
+                       std::unique_ptr<TouchInput> touchIn);
 
 private:
     AppController() = default;
@@ -60,7 +68,10 @@ private:
 
     std::unique_ptr<DisplayManager>   display;
     std::unique_ptr<PowerManager>     power;
+    std::unique_ptr<AudioManager>     audio;
+    std::unique_ptr<SpiBridge>        spi;
     std::unique_ptr<UartBridge>       uart;
+    std::unique_ptr<TouchInput>       touch;
 
     QueueHandle_t app_queue = nullptr;
     TaskHandle_t  app_task  = nullptr;

@@ -2,7 +2,7 @@
 #include "WifiService.hpp"
 #include "WebSocketClient.hpp"
 #include "MqttClient.hpp"
-#include "AudioManager.hpp"
+#include "SpiBridge.hpp"
 #include "Version.hpp"
 
 #include "esp_log.h"
@@ -21,8 +21,6 @@ bool NetworkManager::init(const Config& cfg)
 
     wifi_ = std::make_unique<WifiService>();
     ws_   = std::make_unique<WebSocketClient>();
-    // MQTT is lazy-initialized: created only after WS is connected
-    // to avoid wasting ~9KB RAM and blocking esp-tls during WS setup
 
     wifi_->init();
     ws_->init();
@@ -38,7 +36,6 @@ void NetworkManager::start()
     if (started_) return;
     started_ = true;
 
-    // If we have credentials, connect directly; otherwise autoConnect loads from NVS
     if (!cfg_.wifi_ssid.empty()) {
         wifi_->connectWithCredentials(cfg_.wifi_ssid.c_str(), cfg_.wifi_pass.c_str());
     } else {
@@ -57,8 +54,6 @@ void NetworkManager::stop()
     if (mqtt_) mqtt_->stop();
 
     vTaskDelay(pdMS_TO_TICKS(200));
-    uplink_task_ = nullptr;
-
     ESP_LOGI(TAG, "NetworkManager stopped");
 }
 
@@ -69,8 +64,7 @@ void NetworkManager::setCredentials(const std::string& ssid, const std::string& 
     if (wifi_) wifi_->connectWithCredentials(ssid.c_str(), pass.c_str());
 }
 
-void NetworkManager::setMicBuffer(StreamBufferHandle_t mic_buf) { mic_buf_ = mic_buf; }
-void NetworkManager::setAudioManager(AudioManager* mgr) { audio_mgr_ = mgr; }
+void NetworkManager::setSpiBridge(SpiBridge* bridge) { spi_bridge_ = bridge; }
 
 // === WiFi setup ===
 
@@ -81,17 +75,12 @@ void NetworkManager::setupWifi()
         case 2: // GOT_IP
             ESP_LOGI(TAG, "WiFi connected");
             StateManager::instance().setConnectivityState(state::ConnectivityState::WIFI_CONNECTED);
-
-            // Connect WebSocket
             if (ws_ && !cfg_.ws_url.empty()) {
                 StateManager::instance().setConnectivityState(state::ConnectivityState::CONNECTING_WS);
                 ws_->setUrl(cfg_.ws_url);
                 ws_->connect();
             }
-
-            // MQTT is lazy-started after WS connects (see setupWebSocket)
             break;
-
         case 0: // DISCONNECTED
             ESP_LOGW(TAG, "WiFi disconnected");
             if (!ws_immune_) {
@@ -99,7 +88,6 @@ void NetworkManager::setupWifi()
                 ws_connected_ = false;
             }
             break;
-
         case 1: // CONNECTING
             StateManager::instance().setConnectivityState(state::ConnectivityState::CONNECTING_WIFI);
             break;
@@ -119,27 +107,10 @@ void NetworkManager::setupWebSocket()
             StateManager::instance().setConnectivityState(state::ConnectivityState::ONLINE);
             sendDeviceHandshake();
 
-            // Start uplink task
-            if (!uplink_task_ && mic_buf_) {
-                xTaskCreatePinnedToCore(&NetworkManager::uplinkTaskEntry,
-                    "Uplink", 3072, this, 4, &uplink_task_, 0);
-            }
-
-            // Lazy MQTT: only start if enough heap (MQTT needs ~9KB, keep 15KB for WiFi/WS)
-            if (!mqtt_ && !cfg_.mqtt_url.empty()) {
-                size_t free_heap = esp_get_free_heap_size();
-                if (free_heap > 24000) {
-                    ESP_LOGI(TAG, "Lazy MQTT init (free heap: %lu)", (unsigned long)free_heap);
-                    mqtt_ = std::make_unique<MqttClient>();
-                    mqtt_->init();
-                    setupMqtt();
-                    mqtt_->setUri(cfg_.mqtt_url);
-                    std::string user = cfg_.user_id.empty() ? std::string(getDeviceEfuseID()) : cfg_.user_id;
-                    mqtt_->setCredentials(user, cfg_.tx_key);
-                    mqtt_->start();
-                } else {
-                    ESP_LOGW(TAG, "MQTT skipped - low heap (%lu bytes), need >24KB", (unsigned long)free_heap);
-                }
+            // Deferred MQTT: start in a background task after 10s delay
+            // so the TCP connect attempt doesn't disrupt the WS connection
+            if (!mqtt_ && !cfg_.mqtt_url.empty() && !mqtt_init_pending_) {
+                startMqttDeferred();
             }
             break;
 
@@ -149,7 +120,6 @@ void NetworkManager::setupWebSocket()
             if (!ws_immune_) {
                 StateManager::instance().setConnectivityState(state::ConnectivityState::WIFI_CONNECTED);
             }
-            if (disconnect_cb_) disconnect_cb_();
             break;
 
         case 1: // CONNECTING
@@ -157,28 +127,71 @@ void NetworkManager::setupWebSocket()
         }
     });
 
+    // Server text commands -> parse emotion + relay interaction state to S3 via SPI
     ws_->onText([this](const std::string& msg) {
         ESP_LOGI(TAG, "WS text: %s", msg.c_str());
 
-        // Check for emotion code prefix (2-digit code before command)
+        std::string command = msg;
+
+        // Check for emotion code prefix
         if (msg.length() >= 2) {
             std::string potential_code = msg.substr(0, 2);
             if (potential_code[0] >= '0' && potential_code[0] <= '9' &&
                 potential_code[1] >= '0' && potential_code[1] <= '9') {
                 auto emotion = parseEmotionCode(potential_code);
                 StateManager::instance().setEmotionState(emotion);
-                if (msg.length() > 2) {
-                    if (text_cb_) text_cb_(msg.substr(2));
-                    return;
-                }
+                command = (msg.length() > 2) ? msg.substr(2) : "";
             }
         }
 
-        if (text_cb_) text_cb_(msg);
+        if (command.empty()) return;
+
+        // Process server commands and relay state to S3 via SPI STATUS_UPDATE
+        auto& sm = StateManager::instance();
+        if (command == "PROCESSING_START" || command == "PROCESSING") {
+            sm.setInteractionState(state::InteractionState::PROCESSING, state::InputSource::SERVER_COMMAND);
+        } else if (command == "AUDIO_START" || command == "SPEAKING" || command == "SPEAK_START") {
+            if (!speaking_session_active_) {
+                startSpeakingSession();
+                sm.setInteractionState(state::InteractionState::SPEAKING, state::InputSource::SERVER_COMMAND);
+            }
+        } else if (command == "IDLE" || command == "SPEAK_END" || command == "DONE" || command == "TTS_END") {
+            endSpeakingSession();
+            sm.setInteractionState(state::InteractionState::IDLE, state::InputSource::SERVER_COMMAND);
+        }
     });
 
+    // Server binary -> relay raw bytes to S3 via SPI audio downlink stream.
+    // Data is concatenated [2-byte LE len][opus data] frames. We do NOT parse
+    // frames here — just push raw bytes into SpiBridge's stream buffer.
+    // The SPI slave loop sends MAX_PAYLOAD-sized chunks, and S3 writes them
+    // into its own stream buffer. AudioRecv on S3 parses [2B len][opus] from
+    // the stream buffer, which handles frame boundaries transparently.
+    // This fixes: frames >250 bytes, frames split across WS messages.
     ws_->onBinary([this](const uint8_t* data, size_t len) {
-        if (binary_cb_) binary_cb_(data, len);
+        if (!data || len == 0 || !spi_bridge_) return;
+
+        static uint32_t bin_msg_count = 0;
+        bin_msg_count++;
+        if (bin_msg_count == 1 || bin_msg_count % 100 == 0) {
+            ESP_LOGI(TAG, "WS binary #%lu: %zu bytes", (unsigned long)bin_msg_count, len);
+        }
+
+        // Auto-start speaking session if binary arrives during PROCESSING
+        if (!speaking_session_active_) {
+            auto state = StateManager::instance().getInteractionState();
+            if (state == state::InteractionState::PROCESSING ||
+                state == state::InteractionState::SPEAKING) {
+                startSpeakingSession();
+                StateManager::instance().setInteractionState(
+                    state::InteractionState::SPEAKING, state::InputSource::SERVER_COMMAND);
+            } else {
+                return;
+            }
+        }
+
+        // Push raw bytes — no frame parsing, no MAX_PAYLOAD limit
+        spi_bridge_->sendAudioDownlink(data, len);
     });
 }
 
@@ -204,8 +217,9 @@ void NetworkManager::setupMqtt()
 
             if (cmd == "set_volume") {
                 cJSON* vol = cJSON_GetObjectItem(root, "volume");
-                if (vol && cJSON_IsNumber(vol) && audio_mgr_) {
-                    audio_mgr_->setVolume((uint8_t)vol->valueint);
+                if (vol && cJSON_IsNumber(vol)) {
+                    uint8_t v = (uint8_t)vol->valueint;
+                    ESP_LOGI(TAG, "MQTT set_volume: %d (relay to S3 via UART TODO)", v);
                 }
             } else if (cmd == "reboot") {
                 esp_restart();
@@ -237,6 +251,16 @@ void NetworkManager::sendBinary(const uint8_t* data, size_t len)
     if (ws_ && ws_connected_) ws_->sendBinary(data, len);
 }
 
+void NetworkManager::waitTxDrain(uint32_t timeout_ms)
+{
+    if (ws_) ws_->waitTxDrain(timeout_ms);
+}
+
+size_t NetworkManager::getWsTxFreeSpace() const
+{
+    return ws_ ? ws_->getTxFreeSpace() : 0;
+}
+
 void NetworkManager::setWSImmuneMode(bool enable) { ws_immune_ = enable; }
 
 void NetworkManager::sendDeviceHandshake()
@@ -247,6 +271,56 @@ void NetworkManager::sendDeviceHandshake()
         "\"firmware_version\":\"%s\",\"device_name\":\"%s\"}",
         getDeviceEfuseID(), app_meta::APP_VERSION, app_meta::DEVICE_MODEL);
     sendText(buf);
+}
+
+// === Deferred MQTT init ===
+
+void NetworkManager::startMqttDeferred()
+{
+    mqtt_init_pending_ = true;
+    // One-shot task: waits 10s for WS to stabilize, then starts MQTT.
+    // Runs on Core 0 at low priority so it doesn't interfere with WS or SPI.
+    xTaskCreatePinnedToCore(&NetworkManager::mqttInitTaskEntry, "mqtt_init",
+                            3072, this, 1, nullptr, 0);
+}
+
+void NetworkManager::mqttInitTaskEntry(void* arg)
+{
+    auto* self = static_cast<NetworkManager*>(arg);
+
+    // Wait 10s — let WS connection fully stabilize
+    vTaskDelay(pdMS_TO_TICKS(10000));
+
+    // Only proceed if WS is still connected and MQTT wasn't started yet
+    if (!self->ws_connected_ || self->mqtt_) {
+        ESP_LOGI(TAG, "MQTT deferred init cancelled (ws=%d mqtt=%d)",
+                 (int)self->ws_connected_, self->mqtt_ != nullptr);
+        self->mqtt_init_pending_ = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    size_t free_heap = esp_get_free_heap_size();
+    if (free_heap < 20000) {
+        ESP_LOGW(TAG, "MQTT skipped - low heap (%lu)", (unsigned long)free_heap);
+        self->mqtt_init_pending_ = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Deferred MQTT init (free heap: %lu)", (unsigned long)free_heap);
+    self->mqtt_ = std::make_unique<MqttClient>();
+    self->mqtt_->init();
+    self->setupMqtt();
+    self->mqtt_->setUri(self->cfg_.mqtt_url);
+    std::string user = self->cfg_.user_id.empty()
+                           ? std::string(getDeviceEfuseID())
+                           : self->cfg_.user_id;
+    self->mqtt_->setCredentials(user, self->cfg_.tx_key);
+    self->mqtt_->start();
+
+    self->mqtt_init_pending_ = false;
+    vTaskDelete(nullptr);
 }
 
 // === Emotion parsing ===
@@ -260,94 +334,4 @@ state::EmotionState NetworkManager::parseEmotionCode(const std::string& code)
     if (code == "03") return state::EmotionState::EXCITED;
     if (code == "13") return state::EmotionState::CALM;
     return state::EmotionState::NEUTRAL;
-}
-
-// === Uplink task ===
-
-void NetworkManager::uplinkTaskEntry(void* arg)
-{
-    static_cast<NetworkManager*>(arg)->uplinkLoop();
-}
-
-void NetworkManager::uplinkLoop()
-{
-    ESP_LOGI(TAG, "Uplink task started");
-    // Batch buffer: accumulate multiple length-prefixed Opus frames
-    // then send as one WS binary message to reduce overhead
-    static uint8_t batch_buf[2048];
-    size_t batch_pos = 0;
-    uint32_t frame_count = 0;
-    static uint32_t send_count = 0;
-
-    while (started_) {
-        if (!ws_connected_ ||
-            StateManager::instance().getInteractionState() != state::InteractionState::LISTENING) {
-            // Flush remaining data before going idle
-            if (batch_pos > 0) {
-                sendBinary(batch_buf, batch_pos);
-                batch_pos = 0;
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-
-        // Read 2-byte length prefix
-        uint8_t header[2];
-        size_t got = xStreamBufferReceive(mic_buf_, header, 2, pdMS_TO_TICKS(20));
-        if (got < 2) {
-            // Timeout — flush whatever we have
-            if (batch_pos > 0) {
-                sendBinary(batch_buf, batch_pos);
-                send_count++;
-                if (send_count == 1 || send_count % 50 == 0) {
-                    ESP_LOGI(TAG, "Uplink: batch #%lu, %zu bytes, %lu frames",
-                             (unsigned long)send_count, batch_pos, (unsigned long)frame_count);
-                }
-                batch_pos = 0;
-                frame_count = 0;
-            }
-            continue;
-        }
-
-        uint16_t frame_len = header[0] | ((uint16_t)header[1] << 8);
-        if (frame_len == 0 || frame_len > 256) {
-            ESP_LOGE(TAG, "Uplink: bad frame len %u, resetting", frame_len);
-            xStreamBufferReset(mic_buf_);
-            batch_pos = 0;
-            frame_count = 0;
-            continue;
-        }
-
-        // Check if this frame fits in the batch
-        size_t total_frame = 2 + frame_len;
-        if (batch_pos + total_frame > sizeof(batch_buf)) {
-            // Flush current batch first
-            sendBinary(batch_buf, batch_pos);
-            send_count++;
-            if (send_count == 1 || send_count % 50 == 0) {
-                ESP_LOGI(TAG, "Uplink: batch #%lu, %zu bytes, %lu frames",
-                         (unsigned long)send_count, batch_pos, (unsigned long)frame_count);
-            }
-            batch_pos = 0;
-            frame_count = 0;
-        }
-
-        // Copy header
-        batch_buf[batch_pos] = header[0];
-        batch_buf[batch_pos + 1] = header[1];
-
-        // Read Opus data
-        size_t data_got = xStreamBufferReceive(mic_buf_, batch_buf + batch_pos + 2,
-                                                frame_len, pdMS_TO_TICKS(50));
-        if (data_got < frame_len) {
-            ESP_LOGW(TAG, "Uplink: incomplete frame (%zu/%u)", data_got, frame_len);
-            continue;
-        }
-
-        batch_pos += total_frame;
-        frame_count++;
-    }
-
-    ESP_LOGW(TAG, "Uplink task ended");
-    vTaskDelete(nullptr);
 }

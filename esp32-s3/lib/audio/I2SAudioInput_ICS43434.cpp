@@ -22,10 +22,8 @@ bool I2SAudioInput_ICS43434::init()
     // Configure RX channel in standard I2S (Philips) mode
     i2s_std_config_t std_cfg = {};
 
-    // ESP32-C5 I2S runs ~6.8% faster than configured rate.
-    // Match TX compensation so RX DMA buffer sizing is consistent.
-    uint32_t compensated_rate = cfg_.sample_rate * 1000 / 1068;
-    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(compensated_rate);
+    // Use configured rate directly
+    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(cfg_.sample_rate);
 
     // Philips standard slot config, override to MONO left-only for ICS43434
     std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
@@ -102,13 +100,12 @@ size_t I2SAudioInput_ICS43434::readPcm(int16_t* buffer, size_t max_samples)
 
     static uint32_t diag_count = 0;
     diag_count++;
-    if (diag_count <= 5 || diag_count % 200 == 0) {
+    if (diag_count <= 5 || diag_count % 2000 == 0) {
         ESP_LOGI(TAG, "readPcm[%lu]: err=%d, bytes_read=%zu, capturing=%d",
                  (unsigned long)diag_count, (int)err, bytes_read, (int)capturing_);
     }
 
     // ESP_ERR_TIMEOUT (263) is normal when DMA has fewer bytes than requested.
-    // As long as we got data, use it.
     if (bytes_read == 0) return 0;
 
     size_t samples = bytes_read / sizeof(int32_t);

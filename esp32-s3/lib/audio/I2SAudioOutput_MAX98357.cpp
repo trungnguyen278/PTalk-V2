@@ -15,20 +15,21 @@ I2SAudioOutput_MAX98357::~I2SAudioOutput_MAX98357()
     stopPlayback();
 }
 
+void I2SAudioOutput_MAX98357::resetFilter()
+{
+    bq1_ = {};
+    bq2_ = {};
+}
+
 bool I2SAudioOutput_MAX98357::init()
 {
     if (initialized_) return true;
 
-    // Configure TX channel in standard I2S mode
-    // Must be init'd early for full-duplex shared clock to work with RX
     i2s_std_config_t std_cfg = {};
 
-    // ESP32-C5 I2S runs ~6.8% faster than configured rate (both PLL and XTAL).
-    // Compensate by requesting lower rate so actual output ≈ target.
-    uint32_t compensated_rate = cfg_.sample_rate * 1000 / 1068;
-    ESP_LOGI(TAG, "I2S clock: target=%luHz, compensated=%luHz",
-             (unsigned long)cfg_.sample_rate, (unsigned long)compensated_rate);
-    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(compensated_rate);
+    // Use configured rate directly — compensation may not be needed at 48kHz
+    ESP_LOGI(TAG, "I2S clock: rate=%luHz", (unsigned long)cfg_.sample_rate);
+    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(cfg_.sample_rate);
 
     // Philips MONO left-only for MAX98357 (SD=HIGH → left channel)
     std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
@@ -57,11 +58,9 @@ bool I2SAudioOutput_MAX98357::init()
 bool I2SAudioOutput_MAX98357::startPlayback()
 {
     if (running_) return true;
-
     if (!initialized_ && !init()) return false;
 
-    // TX channel is kept always-enabled for full-duplex clock (mic needs it).
-    // Just mark as running so writePcm works.
+    prev_sample_ = 0;
     running_ = true;
     ESP_LOGI(TAG, "Playback started");
     return true;
@@ -70,9 +69,6 @@ bool I2SAudioOutput_MAX98357::startPlayback()
 void I2SAudioOutput_MAX98357::stopPlayback()
 {
     if (!running_) return;
-
-    // Do NOT disable TX channel — it provides the I2S clock for mic (full-duplex).
-    // MAX98357 automatically enters shutdown when no data is written.
     running_ = false;
     ESP_LOGI(TAG, "Playback stopped");
 }
@@ -87,24 +83,24 @@ size_t I2SAudioOutput_MAX98357::writePcm(const int16_t* pcm, size_t pcm_samples)
     size_t count = (pcm_samples > 512) ? 512 : pcm_samples;
 
     for (size_t i = 0; i < count; ++i) {
-        int32_t scaled = ((int32_t)pcm[i] * volume_) / 100;
+        // Use fixed-point multiply with rounding to reduce quantization noise.
+        // vol_scale = volume * 327 ≈ volume * 32768/100 (Q15 fraction)
+        int32_t scaled = ((int32_t)pcm[i] * (int32_t)(volume_ * 327)) >> 15;
         out_buf[i] = scaled << 16;
     }
 
-    // DEBUG: log first few PCM values periodically
+    // DEBUG: periodic status
     static uint32_t write_count = 0;
     write_count++;
-    if (write_count <= 5 || write_count % 500 == 0) {
-        // Show min/max in this chunk to detect anomalies
+    if (write_count <= 3 || write_count % 2000 == 0) {
         int16_t mn = pcm[0], mx = pcm[0];
         for (size_t i = 1; i < count; ++i) {
             if (pcm[i] < mn) mn = pcm[i];
             if (pcm[i] > mx) mx = pcm[i];
         }
-        ESP_LOGI(TAG, "writePcm[%lu] vol=%d cnt=%zu: min=%d max=%d pcm[0..3]=%d,%d,%d,%d",
+        ESP_LOGI(TAG, "writePcm[%lu] vol=%d cnt=%zu: min=%d max=%d",
                  (unsigned long)write_count, (int)volume_, count,
-                 (int)mn, (int)mx,
-                 (int)pcm[0], (int)(count>1?pcm[1]:0), (int)(count>2?pcm[2]:0), (int)(count>3?pcm[3]:0));
+                 (int)mn, (int)mx);
     }
 
     size_t bytes_written = 0;
@@ -113,7 +109,6 @@ size_t I2SAudioOutput_MAX98357::writePcm(const int16_t* pcm, size_t pcm_samples)
                                        &bytes_written, pdMS_TO_TICKS(200));
 
     if (err != ESP_OK) return 0;
-
     return bytes_written / sizeof(int32_t);
 }
 

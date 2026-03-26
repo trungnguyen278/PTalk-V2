@@ -1,6 +1,7 @@
 #pragma once
 #include "AudioCodec.hpp"
 #include <cstdint>
+#include <mutex>
 
 // Forward declare opus types to avoid pulling in opus.h in the header
 struct OpusEncoder;
@@ -28,20 +29,21 @@ public:
 
     size_t   pcmFrameSamples()   const override { return FRAME_SAMPLES; }
     size_t   encodedFrameBytes() const override { return MAX_ENCODED_BYTES; }
-    uint32_t sampleRate()        const override { return 16000; }
+    uint32_t sampleRate()        const override { return 48000; }
     uint8_t  channels()          const override { return 1; }
 
     // Configuration
     void setBitrate(int bitrate_bps);
 
 private:
-    static constexpr size_t FRAME_SAMPLES      = 320;   // 20ms @ 16kHz
-    static constexpr size_t MAX_ENCODED_BYTES   = 256;   // Max Opus frame (typical ~40-80 bytes for voice)
-    static constexpr int    DEFAULT_BITRATE     = 24000; // 24 kbps
+    static constexpr size_t FRAME_SAMPLES      = 960;   // 20ms @ 48kHz
+    static constexpr size_t MAX_ENCODED_BYTES   = 512;   // Max Opus frame at 48kHz
+    static constexpr int    DEFAULT_BITRATE     = 64000; // 64 kbps
 
     OpusEncoder* encoder_ = nullptr;
     OpusDecoder* decoder_ = nullptr;
     bool initialized_ = false;
+    std::mutex mutex_;
 
     bool initCodec();
 };

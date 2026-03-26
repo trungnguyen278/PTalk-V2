@@ -1,8 +1,7 @@
 #include "AppController.hpp"
 #include "system/NetworkManager.hpp"
-#include "system/AudioManager.hpp"
+#include "system/SpiBridge.hpp"
 #include "system/UartBridge.hpp"
-#include "TouchInput.hpp"
 
 #include "esp_log.h"
 #include <utility>
@@ -44,15 +43,13 @@ AppController::~AppController()
 
 // === Module attachment ===
 
-void AppController::attachModules(std::unique_ptr<AudioManager> audioIn,
-                                   std::unique_ptr<NetworkManager> networkIn,
-                                   std::unique_ptr<TouchInput> touchIn,
+void AppController::attachModules(std::unique_ptr<NetworkManager> networkIn,
+                                   std::unique_ptr<SpiBridge> spiIn,
                                    std::unique_ptr<UartBridge> uartIn)
 {
     if (started.load()) return;
-    audio   = std::move(audioIn);
     network = std::move(networkIn);
-    touch   = std::move(touchIn);
+    spi     = std::move(spiIn);
     uart    = std::move(uartIn);
 }
 
@@ -99,14 +96,11 @@ void AppController::start()
     if (started.load()) return;
     started.store(true);
 
-    // Start controller task
     xTaskCreatePinnedToCore(&AppController::controllerTask, "AppCtrl", 4096, this, 4, &app_task, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Start modules: Network -> Audio -> Touch -> UART
     if (network) network->start();
-    if (audio) audio->start();
-    if (touch) touch->start();
+    if (spi) spi->start();
     if (uart) uart->start();
 
     ESP_LOGI(TAG, "AppController started");
@@ -117,10 +111,9 @@ void AppController::stop()
     if (!started.load()) return;
     started.store(false);
 
-    if (audio) audio->stop();
-    if (network) network->stop();
-    if (touch) touch->stop();
     if (uart) uart->stop();
+    if (network) network->stop();
+    if (spi) spi->stop();
 
     vTaskDelay(pdMS_TO_TICKS(100));
     app_task = nullptr;
@@ -173,22 +166,6 @@ void AppController::processQueue()
                 break;
             case AppMessage::Type::APP_EVENT:
                 switch (msg.app_event) {
-                case event::AppEvent::USER_BUTTON:
-                    if (StateManager::instance().getConnectivityState() != state::ConnectivityState::ONLINE) {
-                        ESP_LOGW(TAG, "Button ignored - not online");
-                        break;
-                    }
-                    if (audio && StateManager::instance().getInteractionState() == state::InteractionState::SPEAKING) {
-                        audio->stopSpeaking();
-                    }
-                    StateManager::instance().setInteractionState(
-                        state::InteractionState::LISTENING, state::InputSource::BUTTON);
-                    break;
-                case event::AppEvent::RELEASE_BUTTON:
-                    // Always stop listening on release, even if connectivity dropped
-                    StateManager::instance().setInteractionState(
-                        state::InteractionState::IDLE, state::InputSource::BUTTON);
-                    break;
                 case event::AppEvent::REBOOT_REQUEST:
                     reboot();
                     break;
@@ -215,18 +192,13 @@ void AppController::onInteractionStateChanged(state::InteractionState s, state::
         uart->sendStatusUpdate(
             (uint8_t)s,
             (uint8_t)StateManager::instance().getConnectivityState(),
-            (uint8_t)StateManager::instance().getSystemState());
+            (uint8_t)StateManager::instance().getSystemState(),
+            (uint8_t)StateManager::instance().getEmotionState());
     }
 
-    switch (s) {
-    case state::InteractionState::TRIGGERED:
-        StateManager::instance().setInteractionState(state::InteractionState::LISTENING, src);
-        break;
-    case state::InteractionState::CANCELLING:
-        StateManager::instance().setInteractionState(state::InteractionState::IDLE, state::InputSource::UNKNOWN);
-        break;
-    default:
-        break;
+    // WS immune mode during SPEAKING
+    if (network) {
+        network->setWSImmuneMode(s == state::InteractionState::SPEAKING);
     }
 }
 
@@ -234,28 +206,17 @@ void AppController::onConnectivityStateChanged(state::ConnectivityState s)
 {
     ESP_LOGI(TAG, "Connectivity: %d", (int)s);
 
-    // Forward to S3
+    // Forward to S3 via UART
     if (uart) {
         uart->sendStatusUpdate(
             (uint8_t)StateManager::instance().getInteractionState(),
             (uint8_t)s,
-            (uint8_t)StateManager::instance().getSystemState());
-    }
-
-    if (s == state::ConnectivityState::OFFLINE && audio) {
-        audio->stopAll();
-        StateManager::instance().setInteractionState(
-            state::InteractionState::IDLE, state::InputSource::UNKNOWN);
+            (uint8_t)StateManager::instance().getSystemState(),
+            (uint8_t)StateManager::instance().getEmotionState());
     }
 }
 
 void AppController::onSystemStateChanged(state::SystemState s)
 {
     ESP_LOGI(TAG, "System: %d", (int)s);
-
-    if (s == state::SystemState::ERROR && audio) {
-        audio->stopAll();
-        StateManager::instance().setInteractionState(
-            state::InteractionState::IDLE, state::InputSource::UNKNOWN);
-    }
 }

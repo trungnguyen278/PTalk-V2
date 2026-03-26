@@ -1,32 +1,26 @@
 #pragma once
 #include <functional>
 #include <atomic>
-#include <string>
+#include <cstdint>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "UartProtocol.hpp"
 
-// UartBridge: UART communication between ESP32-C5 and ESP32-S3
-// C5 receives: WiFi config, MQTT config, ADC data, commands from S3
-// C5 sends: status updates, display commands (emotion) to S3
+// UartBridge for ESP32-C5: sends STATUS_UPDATE to S3, receives CONTROL_CMD from S3.
+// Uses UART1 at 460800 baud. Lightweight alternative to SPI for control messages.
 class UartBridge {
 public:
     struct Config {
-        int uart_num    = 1;
-        int tx_pin      = 6;
-        int rx_pin      = 7;
-        int baud_rate   = 115200;
-        int rx_buf_size = 1024;
-        int tx_buf_size = 512;
+        gpio_num_t pin_tx;
+        gpio_num_t pin_rx;
+        uart_port_t uart_num = UART_NUM_1;
+        int baud_rate = 460800;
     };
 
-    // Callbacks for received data from S3
-    using WifiConfigCb  = std::function<void(const std::string& ssid, const std::string& pass)>;
-    using MqttConfigCb  = std::function<void(const std::string& uri, const std::string& user, const std::string& pass)>;
-    using WsConfigCb    = std::function<void(const std::string& url)>;
-    using AdcDataCb     = std::function<void(uint16_t voltage_mv, uint8_t battery_pct, bool charging)>;
-    using CommandCb     = std::function<void(uart_proto::Command cmd, const uint8_t* data, size_t len)>;
+    using ControlCmdCb = std::function<void(uart_proto::ControlCmd cmd,
+                                             const uint8_t* data, size_t len)>;
 
     UartBridge() = default;
     ~UartBridge();
@@ -35,34 +29,19 @@ public:
     void start();
     void stop();
 
-    // Register callbacks for incoming messages
-    void onWifiConfig(WifiConfigCb cb)  { wifi_cb_ = std::move(cb); }
-    void onMqttConfig(MqttConfigCb cb)  { mqtt_cb_ = std::move(cb); }
-    void onWsConfig(WsConfigCb cb)      { ws_cb_ = std::move(cb); }
-    void onAdcData(AdcDataCb cb)        { adc_cb_ = std::move(cb); }
-    void onCommand(CommandCb cb)        { cmd_cb_ = std::move(cb); }
+    // Send status update to S3 (non-blocking)
+    bool sendStatusUpdate(uint8_t interaction, uint8_t connectivity,
+                          uint8_t system_state, uint8_t emotion);
 
-    // Send messages to S3
-    bool sendStatusUpdate(uint8_t interaction, uint8_t connectivity, uint8_t system_state);
-    bool sendDisplayCmd(uint8_t emotion);
-    bool sendConfigRequest();
+    // Callback for control commands received from S3
+    void onControlCmd(ControlCmdCb cb) { control_cb_ = std::move(cb); }
 
 private:
     static void rxTaskEntry(void* arg);
-    void rxTaskLoop();
-
-    void handleFrame(uint8_t type, const uint8_t* payload, uint16_t len);
-    bool sendFrame(uint8_t type, const uint8_t* payload, uint16_t len);
+    void rxLoop();
 
     Config cfg_{};
-    uart_port_t uart_port_ = (uart_port_t)-1;
     std::atomic<bool> started_{false};
     TaskHandle_t rx_task_ = nullptr;
-
-    // Callbacks
-    WifiConfigCb  wifi_cb_;
-    MqttConfigCb  mqtt_cb_;
-    WsConfigCb    ws_cb_;
-    AdcDataCb     adc_cb_;
-    CommandCb     cmd_cb_;
+    ControlCmdCb control_cb_;
 };

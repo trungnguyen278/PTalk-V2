@@ -1,9 +1,12 @@
 #include "DeviceProfile.hpp"
 #include "AppController.hpp"
+#include "esp_log.h"
 
 // System managers
 #include "system/DisplayManager.hpp"
 #include "system/PowerManager.hpp"
+#include "system/AudioManager.hpp"
+#include "system/SpiBridge.hpp"
 #include "system/UartBridge.hpp"
 #include "system/StateManager.hpp"
 #include "system/StateTypes.hpp"
@@ -11,6 +14,13 @@
 // Drivers
 #include "DisplayDriver.hpp"
 #include "Power.hpp"
+#include "I2SAudioInput_ICS43434.hpp"
+#include "I2SAudioOutput_MAX98357.hpp"
+#include "TouchInput.hpp"
+
+// Codec
+#include "AudioCodec.hpp"
+#include "OpusCodec.hpp"
 
 // Pin config
 #include "config/PinConfig.hpp"
@@ -28,6 +38,8 @@
 #include "assets/icons/battery_full.hpp"
 #include "assets/icons/critical_power.hpp"
 
+#include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -88,7 +100,7 @@ static void registerEmotions(DisplayManager* display)
         anim1bit.fps             = a.fps;
         anim1bit.loop            = a.loop;
         anim1bit.max_packed_size = a.max_packed_size;
-        anim1bit.base_frame      = nullptr; // Frame 0 is diff from black
+        anim1bit.base_frame      = nullptr;
         anim1bit.frames          = a.frames ? a.frames() : nullptr;
         display->registerEmotion(name, anim1bit);
     };
@@ -107,7 +119,8 @@ static void registerEmotions(DisplayManager* display)
 // =============================================================================
 bool DeviceProfile::setup(AppController& app)
 {
-    ESP_LOGI(TAG, "DeviceProfile setup begin (ESP32-S3)");
+    ESP_LOGI(TAG, "DeviceProfile setup begin (ESP32-S3), free heap: %lu",
+             (unsigned long)esp_get_free_heap_size());
 
     // Init NVS
     esp_err_t nvs_err = nvs_flash_init();
@@ -120,7 +133,7 @@ bool DeviceProfile::setup(AppController& app)
     auto user = user_cfg::load();
 
     // =========================================================
-    // 1. DISPLAY (ST7789 240x320 via SPI)
+    // 1. DISPLAY (ST7789 240x320 via SPI2)
     // =========================================================
     DisplayDriver::Config lcd_cfg{};
     lcd_cfg.spi_host = SPI2_HOST;
@@ -144,18 +157,14 @@ bool DeviceProfile::setup(AppController& app)
     }
 
     display_mgr->setBrightness(user.brightness);
-
-    // Register emotion animations
     registerEmotions(display_mgr.get());
-
-    // Enable state binding (display auto-reacts to StateManager)
     display_mgr->enableStateBinding(true);
 
     // =========================================================
     // 2. POWER (Battery ADC)
     // =========================================================
     auto power_drv = std::make_unique<Power>(
-        ADC1_CHANNEL_0, // GPIO1
+        ADC1_CHANNEL_0,
         (gpio_num_t)PinConfig::CHG_STATUS,
         (gpio_num_t)PinConfig::CHG_FULL,
         PinConfig::BAT_R1,
@@ -171,21 +180,135 @@ bool DeviceProfile::setup(AppController& app)
     if (!power_mgr->init()) {
         ESP_LOGW(TAG, "PowerManager init failed (non-fatal)");
     }
-
-    // Link display for battery % overlay
     power_mgr->setDisplayManager(display_mgr.get());
 
     // =========================================================
-    // 3. UART BRIDGE (Communication with C5)
+    // 3. MAX98357 CONTROL PINS
+    // =========================================================
+    gpio_config_t spk_sd_cfg = {};
+    spk_sd_cfg.pin_bit_mask = (1ULL << PinConfig::SPK_SD);
+    spk_sd_cfg.mode = GPIO_MODE_OUTPUT;
+    spk_sd_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    spk_sd_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&spk_sd_cfg);
+    gpio_set_level((gpio_num_t)PinConfig::SPK_SD, 1);
+
+    gpio_config_t spk_gain_cfg = {};
+    spk_gain_cfg.pin_bit_mask = (1ULL << PinConfig::SPK_GAIN);
+    spk_gain_cfg.mode = GPIO_MODE_INPUT;  // High-Z (floating) = 9dB
+    spk_gain_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    spk_gain_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&spk_gain_cfg);
+    ESP_LOGI(TAG, "MAX98357 SD=HIGH (enabled), GAIN=float (9dB)");
+
+    // =========================================================
+    // 4. I2S FULL-DUPLEX AUDIO (shared BCLK/WS for mic+speaker)
+    // =========================================================
+    i2s_chan_handle_t tx_chan = nullptr;
+    i2s_chan_handle_t rx_chan = nullptr;
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(
+        (i2s_port_t)PinConfig::I2S_NUM, I2S_ROLE_MASTER);
+    // Larger DMA buffer to prevent underrun during Opus decode jitter.
+    // 6 descriptors × 480 frames = 2880 samples (~60ms @ 48kHz).
+    // With only 4×240 (960 samples = 20ms), a single decode stall causes audible pop.
+    chan_cfg.dma_desc_num  = 6;
+    chan_cfg.dma_frame_num = 480;
+
+    esp_err_t err = i2s_new_channel(&chan_cfg, &tx_chan, &rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2S channel creation failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    auto audio_mgr = std::make_unique<AudioManager>();
+
+    I2SAudioInput_ICS43434::Config mic_cfg{
+        .pin_bclk    = (gpio_num_t)PinConfig::I2S_BCLK,
+        .pin_ws      = (gpio_num_t)PinConfig::I2S_WS,
+        .pin_din     = (gpio_num_t)PinConfig::I2S_DIN,
+        .sample_rate = 48000
+    };
+    auto mic = std::make_unique<I2SAudioInput_ICS43434>(rx_chan, mic_cfg);
+
+    I2SAudioOutput_MAX98357::Config spk_cfg{
+        .pin_bclk    = (gpio_num_t)PinConfig::I2S_BCLK,
+        .pin_ws      = (gpio_num_t)PinConfig::I2S_WS,
+        .pin_dout    = (gpio_num_t)PinConfig::I2S_DOUT,
+        .sample_rate = 48000
+    };
+    auto speaker = std::make_unique<I2SAudioOutput_MAX98357>(tx_chan, spk_cfg);
+    speaker->init();
+    speaker->setVolume(user.volume);
+
+    auto codec = std::make_unique<OpusCodec>();
+    ESP_LOGI(TAG, "Using Opus codec");
+
+    audio_mgr->setInput(std::move(mic));
+    audio_mgr->setOutput(std::move(speaker));
+    audio_mgr->setCodec(std::move(codec));
+
+    if (!audio_mgr->init()) {
+        ESP_LOGE(TAG, "AudioManager init failed");
+        return false;
+    }
+
+    i2s_channel_enable(tx_chan);
+    ESP_LOGI(TAG, "I2S TX enabled (clock source for full-duplex)");
+
+    // =========================================================
+    // 5. SPI BRIDGE (Communication with C5 via SPI3)
+    // =========================================================
+    auto spi_bridge = std::make_unique<SpiBridge>();
+    SpiBridge::Config spi_cfg{
+        .pin_mosi      = (gpio_num_t)PinConfig::SPI3_MOSI,
+        .pin_miso      = (gpio_num_t)PinConfig::SPI3_MISO,
+        .pin_sclk      = (gpio_num_t)PinConfig::SPI3_SCLK,
+        .pin_cs        = (gpio_num_t)PinConfig::SPI3_CS,
+        .pin_handshake = (gpio_num_t)PinConfig::SPI3_HANDSHAKE,
+        .clock_speed_hz = 10 * 1000 * 1000  // 10 MHz
+    };
+
+    if (!spi_bridge->init(spi_cfg)) {
+        ESP_LOGE(TAG, "SpiBridge init failed");
+        return false;
+    }
+
+    // Wire SpiBridge to AudioManager
+    audio_mgr->setSpiBridge(spi_bridge.get());
+
+    // SPI downlink: C5 sends raw audio bytes -> speaker encoded stream buffer.
+    // C5 streams raw bytes (up to MAX_PAYLOAD per SPI transaction, NOT frame-aligned).
+    // The stream buffer accumulates bytes; AudioRecv parses [2B len][opus] from it.
+    // This handles Opus frames of any size (including >250 bytes from server).
+    StreamBufferHandle_t spk_sb = audio_mgr->getSpeakerEncodedBuffer();
+    spi_bridge->onAudioDownlink([spk_sb](const uint8_t* data, size_t len) {
+        if (!data || len == 0) return;
+        auto& sm = StateManager::instance();
+        auto interaction = sm.getInteractionState();
+        if (interaction == state::InteractionState::LISTENING) return;
+
+        // Auto-trigger SPEAKING if audio arrives during PROCESSING/IDLE
+        if (interaction != state::InteractionState::SPEAKING) {
+            ESP_LOGI("SpiBridge", "Audio downlink auto-trigger SPEAKING (was %d)", (int)interaction);
+            sm.setInteractionState(state::InteractionState::SPEAKING, state::InputSource::SERVER_COMMAND);
+        }
+
+        // All-or-nothing: partial writes break [2B len][opus] stream alignment.
+        // Dropping a full SPI chunk is safe — Opus PLC handles gaps gracefully.
+        size_t space = xStreamBufferSpacesAvailable(spk_sb);
+        if (space >= len) {
+            xStreamBufferSend(spk_sb, data, len, 0);
+        }
+    });
+
+    // =========================================================
+    // 6. UART BRIDGE (Control/status with C5 via UART1)
     // =========================================================
     auto uart_bridge = std::make_unique<UartBridge>();
     UartBridge::Config uart_cfg{
-        .uart_num    = PinConfig::UART_NUM,
-        .tx_pin      = PinConfig::UART_TX,
-        .rx_pin      = PinConfig::UART_RX,
-        .baud_rate   = PinConfig::UART_BAUD_RATE,
-        .rx_buf_size = 1024,
-        .tx_buf_size = 512
+        .pin_tx = (gpio_num_t)PinConfig::UART_TX,
+        .pin_rx = (gpio_num_t)PinConfig::UART_RX,
     };
 
     if (!uart_bridge->init(uart_cfg)) {
@@ -193,38 +316,55 @@ bool DeviceProfile::setup(AppController& app)
         return false;
     }
 
-    // UART: receive status updates from C5 -> update StateManager
-    uart_bridge->onStatusUpdate([](uint8_t interaction, uint8_t connectivity, uint8_t system_state) {
+    // UART status: C5 sends connectivity/emotion state via UART
+    uart_bridge->onStatusUpdate([](uint8_t interaction, uint8_t connectivity,
+                                    uint8_t system_state, uint8_t emotion) {
         auto& sm = StateManager::instance();
-        sm.setInteractionState(static_cast<state::InteractionState>(interaction));
+
+        // C5 dictates the connectivity, system, and emotion states
         sm.setConnectivityState(static_cast<state::ConnectivityState>(connectivity));
-    });
+        sm.setEmotionState(static_cast<state::EmotionState>(emotion));
+        sm.setSystemState(static_cast<state::SystemState>(system_state));
 
-    // UART: receive display command (emotion) from C5
-    uart_bridge->onDisplayCmd([](uint8_t emotion) {
-        StateManager::instance().setEmotionState(static_cast<state::EmotionState>(emotion));
-    });
-
-    // UART: C5 requests saved config -> S3 no longer stores WiFi/MQTT config (no BLE)
-    // Config is managed entirely on C5 side
-
-    // PowerManager: send ADC data to C5 when power state changes
-    UartBridge* uart_ptr = uart_bridge.get();
-    PowerManager* pwr_ptr = power_mgr.get();
-    StateManager::instance().subscribePower([uart_ptr, pwr_ptr](state::PowerState s) {
-        uint16_t mv = (uint16_t)(pwr_ptr->getVoltage() * 1000);
-        uint8_t pct = pwr_ptr->getPercent();
-        bool charging = pwr_ptr->isCharging();
-        uart_ptr->sendAdcData(mv, pct, charging);
+        // Let C5 drive the interaction state as well (so Server can trigger SPEAKING)
+        auto new_inter = static_cast<state::InteractionState>(interaction);
+        if (new_inter == state::InteractionState::PROCESSING || new_inter == state::InteractionState::SPEAKING) {
+            sm.setInteractionState(new_inter, state::InputSource::UNKNOWN);
+        } else if (new_inter == state::InteractionState::IDLE && sm.getInteractionState() == state::InteractionState::SPEAKING) {
+            sm.setInteractionState(state::InteractionState::IDLE, state::InputSource::UNKNOWN);
+        }
     });
 
     // =========================================================
-    // 4. ATTACH MODULES -> APP CONTROLLER
+    // 7. TOUCH INPUT (Button)
+    // =========================================================
+    auto touch_input = std::make_unique<TouchInput>();
+    TouchInput::Config touch_cfg{
+        .pin = (gpio_num_t)PinConfig::BUTTON,
+        .active_low = true,
+        .long_press_ms = 1200
+    };
+
+    if (!touch_input->init(touch_cfg)) {
+        ESP_LOGE(TAG, "TouchInput init failed");
+        return false;
+    }
+
+    touch_input->onEvent([&app](TouchInput::Event e) {
+        if (e == TouchInput::Event::PRESS)   app.postEvent(event::AppEvent::USER_BUTTON);
+        if (e == TouchInput::Event::RELEASE) app.postEvent(event::AppEvent::RELEASE_BUTTON);
+    });
+
+    // =========================================================
+    // 8. ATTACH MODULES -> APP CONTROLLER
     // =========================================================
     app.attachModules(
         std::move(display_mgr),
         std::move(power_mgr),
-        std::move(uart_bridge));
+        std::move(audio_mgr),
+        std::move(spi_bridge),
+        std::move(uart_bridge),
+        std::move(touch_input));
 
     ESP_LOGI(TAG, "DeviceProfile setup OK (ESP32-S3)");
     return true;
