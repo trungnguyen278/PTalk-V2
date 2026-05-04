@@ -217,8 +217,8 @@ bool DeviceProfile::setup(AppController& app)
     // =========================================================
     auto network_mgr = std::make_unique<NetworkManager>();
 
-    const std::string default_ws   = "10.170.75.193:8000";
-    const std::string default_mqtt = "10.170.75.193:1883";
+    const std::string default_ws   = "10.170.75.59:8000";
+    const std::string default_mqtt = "10.170.75.59:1883";
 
     NetworkManager::Config net_cfg{};
     net_cfg.wifi_ssid = user.wifi_ssid;
