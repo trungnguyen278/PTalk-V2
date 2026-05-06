@@ -10,8 +10,8 @@
 namespace PinConfig {
 
 // --- SPI Display (ST7789 240x320) on SPI2 ---
-static constexpr int SPI_MOSI  = 11;
-static constexpr int SPI_SCLK  = 12;
+static constexpr int SPI_MOSI  = 12;
+static constexpr int SPI_SCLK  = 11;
 static constexpr int LCD_CS    = 10;
 static constexpr int LCD_DC    = 13;
 static constexpr int LCD_RST   = 14;
