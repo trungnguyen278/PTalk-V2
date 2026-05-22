@@ -50,7 +50,7 @@ bool DisplayManager::init(std::unique_ptr<DisplayDriver> driver, int width, int 
     width_ = width;
     height_ = height;
 
-    drv->setRotation(1); // Landscape
+    drv->setRotation(3); // Landscape (rotated 180°)
     // Sync dimensions after rotation (driver swaps width↔height for landscape)
     width_ = drv->width();
     height_ = drv->height();

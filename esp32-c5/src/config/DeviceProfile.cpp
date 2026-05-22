@@ -113,10 +113,74 @@ bool DeviceProfile::setup(AppController& app)
     auto user = user_cfg::load();
 
     // =========================================================
-    // 1. BLE PROVISIONING (if no WiFi credentials in NVS)
+    // 1. BOOT WIFI TEST & BLE PROVISIONING
     // =========================================================
-    if (user.wifi_ssid.empty()) {
-        ESP_LOGI(TAG, "No WiFi credentials found - starting BLE provisioning");
+    static constexpr int MAX_BOOT_WIFI_RETRIES = 5;
+    bool need_ble = user.wifi_ssid.empty();
+
+    // If credentials exist, test WiFi connection at boot
+    if (!need_ble) {
+        ESP_LOGI(TAG, "Testing WiFi at boot: SSID=%s", user.wifi_ssid.c_str());
+
+        esp_netif_init();
+        esp_event_loop_create_default();
+        esp_netif_t* boot_netif = esp_netif_create_default_wifi_sta();
+        wifi_init_config_t test_wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+        esp_wifi_init(&test_wifi_cfg);
+        esp_wifi_set_mode(WIFI_MODE_STA);
+
+        wifi_config_t sta_cfg = {};
+        strncpy((char*)sta_cfg.sta.ssid, user.wifi_ssid.c_str(), sizeof(sta_cfg.sta.ssid) - 1);
+        strncpy((char*)sta_cfg.sta.password, user.wifi_pass.c_str(), sizeof(sta_cfg.sta.password) - 1);
+        esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+        esp_wifi_start();
+
+        static volatile bool boot_got_ip = false;
+        static volatile int  boot_disconnects = 0;
+        boot_got_ip = false;
+        boot_disconnects = 0;
+
+        esp_event_handler_instance_t h_disconnect, h_got_ip;
+        esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+            [](void*, esp_event_base_t, int32_t, void*) {
+                boot_disconnects++;
+                ESP_LOGW(TAG, "Boot WiFi disconnect #%d/%d",
+                         (int)boot_disconnects, MAX_BOOT_WIFI_RETRIES);
+                if (boot_disconnects < MAX_BOOT_WIFI_RETRIES) {
+                    esp_wifi_connect();
+                }
+            }, nullptr, &h_disconnect);
+        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+            [](void*, esp_event_base_t, int32_t, void*) {
+                boot_got_ip = true;
+            }, nullptr, &h_got_ip);
+
+        esp_wifi_connect();
+
+        while (!boot_got_ip && boot_disconnects < MAX_BOOT_WIFI_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, h_disconnect);
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, h_got_ip);
+
+        if (!boot_got_ip) {
+            ESP_LOGW(TAG, "WiFi failed after %d attempts, falling back to BLE",
+                     (int)boot_disconnects);
+            need_ble = true;
+        } else {
+            ESP_LOGI(TAG, "WiFi connected at boot");
+        }
+
+        esp_wifi_disconnect();
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        esp_netif_destroy(boot_netif);
+    }
+
+    // BLE provisioning: no credentials OR boot WiFi connection failed
+    if (need_ble) {
+        ESP_LOGI(TAG, "Starting BLE provisioning");
 
         esp_netif_init();
         esp_event_loop_create_default();
@@ -217,8 +281,8 @@ bool DeviceProfile::setup(AppController& app)
     // =========================================================
     auto network_mgr = std::make_unique<NetworkManager>();
 
-    const std::string default_ws   = "10.170.75.59:8000";
-    const std::string default_mqtt = "10.170.75.59:1883";
+    const std::string default_ws   = "ws://171.226.10.121:8000/v2/ws";
+    const std::string default_mqtt = "171.226.10.121:1883";
 
     NetworkManager::Config net_cfg{};
     net_cfg.wifi_ssid = user.wifi_ssid;
