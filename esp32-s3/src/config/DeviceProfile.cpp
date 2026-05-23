@@ -364,7 +364,11 @@ bool DeviceProfile::setup(AppController& app)
         auto new_inter = static_cast<state::InteractionState>(interaction);
         auto cur_inter = sm.getInteractionState();
         if (new_inter == state::InteractionState::SPEAKING) {
-            sm.setInteractionState(new_inter, state::InputSource::UNKNOWN);
+            if (cur_inter == state::InteractionState::PROCESSING ||
+                cur_inter == state::InteractionState::LISTENING ||
+                cur_inter == state::InteractionState::TRIGGERED) {
+                sm.setInteractionState(new_inter, state::InputSource::UNKNOWN);
+            }
         } else if (new_inter == state::InteractionState::PROCESSING &&
                    cur_inter != state::InteractionState::SPEAKING) {
             sm.setInteractionState(new_inter, state::InputSource::UNKNOWN);

@@ -399,12 +399,10 @@ void AudioManager::audioRecvLoop()
                 codec->reset();
                 size_t trial_samples = codec->decode(frame_data, candidate, pcm_out, pcm_frame);
                 if (trial_samples > 0) {
-                    xStreamBufferSend(sb_spk_pcm, pcm_out, trial_samples * sizeof(int16_t), pdMS_TO_TICKS(200));
-                    consecutive_errors = 0;
                     new_session = false;
                     last_decode_tick = xTaskGetTickCount();
                     resynced = true;
-                    ESP_LOGI(TAG, "AudioRecv: resynced after skipping %d bytes (decode OK)", skip);
+                    ESP_LOGI(TAG, "AudioRecv: resynced after skipping %d bytes (decode OK, PCM discarded)", skip);
                 }
             }
             if (!resynced) {
