@@ -288,10 +288,14 @@ bool DeviceProfile::setup(AppController& app)
         auto interaction = sm.getInteractionState();
         if (interaction == state::InteractionState::LISTENING) return;
 
-        // Auto-trigger SPEAKING if audio arrives during PROCESSING/IDLE
-        if (interaction != state::InteractionState::SPEAKING) {
-            ESP_LOGI("SpiBridge", "Audio downlink auto-trigger SPEAKING (was %d)", (int)interaction);
+        // Auto-trigger SPEAKING only from PROCESSING (audio binary arrives before
+        // the SPEAKING text command). Do NOT auto-trigger from IDLE — stale SPI data
+        // arriving during stopSpeaking() drain would regress the state back to SPEAKING.
+        if (interaction == state::InteractionState::PROCESSING) {
+            ESP_LOGI("SpiBridge", "Audio downlink auto-trigger SPEAKING (was PROCESSING)");
             sm.setInteractionState(state::InteractionState::SPEAKING, state::InputSource::SERVER_COMMAND);
+        } else if (interaction != state::InteractionState::SPEAKING) {
+            return;
         }
 
         // All-or-nothing write to preserve [2B len][opus] stream alignment.

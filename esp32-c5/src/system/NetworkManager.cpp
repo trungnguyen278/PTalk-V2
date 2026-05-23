@@ -88,6 +88,11 @@ void NetworkManager::setupWifi()
         case 0: // DISCONNECTED
             ESP_LOGW(TAG, "WiFi disconnected");
             if (!ws_immune_) {
+                if (speaking_session_active_) {
+                    endSpeakingSession();
+                    StateManager::instance().setInteractionState(
+                        state::InteractionState::IDLE, state::InputSource::SERVER_COMMAND);
+                }
                 StateManager::instance().setConnectivityState(state::ConnectivityState::OFFLINE);
                 ws_connected_ = false;
             }
@@ -121,6 +126,12 @@ void NetworkManager::setupWebSocket()
         case 0: // CLOSED
             ESP_LOGW(TAG, "WebSocket disconnected");
             ws_connected_ = false;
+            if (speaking_session_active_) {
+                ESP_LOGW(TAG, "WS disconnected mid-stream, ending speaking session");
+                endSpeakingSession();
+                StateManager::instance().setInteractionState(
+                    state::InteractionState::IDLE, state::InputSource::SERVER_COMMAND);
+            }
             if (!ws_immune_) {
                 StateManager::instance().setConnectivityState(state::ConnectivityState::WIFI_CONNECTED);
             }
@@ -166,12 +177,9 @@ void NetworkManager::setupWebSocket()
     });
 
     // Server binary -> relay raw bytes to S3 via SPI audio downlink stream.
-    // Data is concatenated [2-byte LE len][opus data] frames. We do NOT parse
-    // frames here — just push raw bytes into SpiBridge's stream buffer.
-    // The SPI slave loop sends MAX_PAYLOAD-sized chunks, and S3 writes them
-    // into its own stream buffer. AudioRecv on S3 parses [2B len][opus] from
-    // the stream buffer, which handles frame boundaries transparently.
-    // This fixes: frames >250 bytes, frames split across WS messages.
+    // Data is concatenated [2-byte LE len][opus data] frames. We push raw bytes
+    // into SpiBridge's stream buffer — S3 parses [2B len][opus] from its own
+    // stream buffer, which handles frame boundaries transparently.
     ws_->onBinary([this](const uint8_t* data, size_t len) {
         if (!data || len == 0 || !spi_bridge_) return;
 
@@ -181,7 +189,6 @@ void NetworkManager::setupWebSocket()
             ESP_LOGI(TAG, "WS binary #%lu: %zu bytes", (unsigned long)bin_msg_count, len);
         }
 
-        // Auto-start speaking session if binary arrives during PROCESSING
         if (!speaking_session_active_) {
             auto state = StateManager::instance().getInteractionState();
             if (state == state::InteractionState::PROCESSING ||
@@ -194,7 +201,6 @@ void NetworkManager::setupWebSocket()
             }
         }
 
-        // Push raw bytes — no frame parsing, no MAX_PAYLOAD limit
         spi_bridge_->sendAudioDownlink(data, len);
     });
 }
