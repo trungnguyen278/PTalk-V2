@@ -15,6 +15,7 @@ class WebSocketClient;
 class MqttClient;
 class SpiBridge;
 class UartBridge;
+class BluetoothService;
 
 // NetworkManager for ESP32-C5: WiFi + WebSocket + MQTT
 // Audio is now on S3. C5 relays audio between SPI and WebSocket.
@@ -54,6 +55,10 @@ public:
     void startSpeakingSession()          { speaking_session_active_ = true; }
     void endSpeakingSession()            { speaking_session_active_ = false; }
 
+    // BLE config mode (triggered by MQTT command)
+    void startBleConfigMode();
+    void stopBleConfigMode();
+
     // Emotion parsing
     static state::EmotionState parseEmotionCode(const std::string& code);
 
@@ -76,6 +81,11 @@ private:
     std::unique_ptr<MqttClient>      mqtt_;
     SpiBridge*  spi_bridge_  = nullptr;
     UartBridge* uart_bridge_ = nullptr;
+
+    // BLE config mode
+    BluetoothService* ble_ = nullptr;
+    std::atomic<bool> ble_config_active_{false};
+    static void bleConfigTaskEntry(void* arg);
 
     std::atomic<bool> started_{false};
     std::atomic<bool> ws_connected_{false};

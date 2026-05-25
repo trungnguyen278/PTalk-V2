@@ -5,9 +5,11 @@
 #include "SpiBridge.hpp"
 #include "UartBridge.hpp"
 #include "UartProtocol.hpp"
+#include "BluetoothService.hpp"
 #include "Version.hpp"
 
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
 #include <cstring>
@@ -376,7 +378,12 @@ void NetworkManager::setupMqtt()
 
         // ----- request_ble_config -----
         } else if (cmd == "request_ble_config") {
-            mqttPublishResponse("request_ble_config", "ok", "\"message\":\"BLE config mode not yet implemented\"");
+            if (ble_config_active_) {
+                mqttPublishResponse("request_ble_config", "ok", "\"message\":\"BLE config already active\"");
+            } else {
+                startBleConfigMode();
+                mqttPublishResponse("request_ble_config", "ok", "\"message\":\"BLE config mode started\"");
+            }
 
         // ----- set_wifi -----
         } else if (cmd == "set_wifi") {
@@ -500,4 +507,162 @@ state::EmotionState NetworkManager::parseEmotionCode(const std::string& code)
     if (code == "03") return state::EmotionState::EXCITED;
     if (code == "13") return state::EmotionState::CALM;
     return state::EmotionState::NEUTRAL;
+}
+
+// === BLE Config Mode (runtime, triggered by MQTT) ===
+
+void NetworkManager::startBleConfigMode()
+{
+    if (ble_config_active_) return;
+    ble_config_active_ = true;
+
+    xTaskCreatePinnedToCore(&NetworkManager::bleConfigTaskEntry, "ble_cfg",
+                            4096, this, 2, nullptr, 0);
+}
+
+void NetworkManager::stopBleConfigMode()
+{
+    if (!ble_config_active_) return;
+    if (ble_) {
+        ble_->deinit();
+        delete ble_;
+        ble_ = nullptr;
+    }
+    ble_config_active_ = false;
+    ESP_LOGI(TAG, "BLE config mode stopped");
+}
+
+void NetworkManager::bleConfigTaskEntry(void* arg)
+{
+    auto* self = static_cast<NetworkManager*>(arg);
+
+    size_t free_heap = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "BLE config task start, free heap: %lu", (unsigned long)free_heap);
+
+    if (free_heap < 60000) {
+        ESP_LOGW(TAG, "Not enough heap for BLE (%lu), aborting", (unsigned long)free_heap);
+        self->mqttPublishResponse("request_ble_config", "error",
+                                  "\"message\":\"insufficient memory for BLE\"");
+        self->ble_config_active_ = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // Scan WiFi networks to provide list via BLE
+    wifi_scan_config_t scan_cfg = {};
+    esp_wifi_scan_start(&scan_cfg, true);
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    std::vector<wifi_ap_record_t> ap_records(ap_count);
+    esp_wifi_scan_get_ap_records(&ap_count, ap_records.data());
+
+    std::vector<WifiInfo> networks;
+    for (int i = 0; i < ap_count; i++) {
+        WifiInfo info;
+        info.ssid = (const char*)ap_records[i].ssid;
+        info.rssi = ap_records[i].rssi;
+        networks.push_back(info);
+    }
+    ESP_LOGI(TAG, "BLE config: scanned %d WiFi networks", (int)networks.size());
+
+    // Prepare current config to pre-fill BLE characteristics
+    BluetoothService::ConfigData current_cfg;
+    {
+        nvs_handle_t h;
+        if (nvs_open("storage", NVS_READONLY, &h) == ESP_OK) {
+            size_t len = 0;
+            char buf[128];
+
+            len = sizeof(buf);
+            if (nvs_get_str(h, "device_name", buf, &len) == ESP_OK) current_cfg.device_name = buf;
+            len = sizeof(buf);
+            if (nvs_get_str(h, "ws_url", buf, &len) == ESP_OK) current_cfg.ws_url = buf;
+            len = sizeof(buf);
+            if (nvs_get_str(h, "mqtt_url", buf, &len) == ESP_OK) current_cfg.mqtt_url = buf;
+            len = sizeof(buf);
+            if (nvs_get_str(h, "user_id", buf, &len) == ESP_OK) current_cfg.mqtt_user = buf;
+            len = sizeof(buf);
+            if (nvs_get_str(h, "tx_key", buf, &len) == ESP_OK) current_cfg.mqtt_pass = buf;
+
+            nvs_get_u8(h, "volume", &current_cfg.volume);
+            nvs_get_u8(h, "brightness", &current_cfg.brightness);
+            nvs_close(h);
+        }
+    }
+
+    // Init BLE
+    self->ble_ = new BluetoothService();
+    if (!self->ble_->init("PTalk", networks, &current_cfg)) {
+        ESP_LOGE(TAG, "BLE init failed in config mode");
+        delete self->ble_;
+        self->ble_ = nullptr;
+        self->ble_config_active_ = false;
+        self->mqttPublishResponse("request_ble_config", "error",
+                                  "\"message\":\"BLE init failed\"");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    static volatile bool config_received = false;
+    static BluetoothService::ConfigData received_cfg;
+    config_received = false;
+
+    self->ble_->onConfigComplete([](const BluetoothService::ConfigData& cfg) {
+        received_cfg = cfg;
+        config_received = true;
+    });
+
+    self->ble_->start();
+    ESP_LOGI(TAG, "BLE advertising started, waiting for config (timeout 120s)...");
+
+    // Wait for config or timeout (120 seconds)
+    constexpr int BLE_CONFIG_TIMEOUT_MS = 120000;
+    for (int ms = 0; !config_received && ms < BLE_CONFIG_TIMEOUT_MS; ms += 100) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // Teardown BLE
+    self->ble_->deinit();
+    delete self->ble_;
+    self->ble_ = nullptr;
+    self->ble_config_active_ = false;
+
+    if (!config_received) {
+        ESP_LOGW(TAG, "BLE config timeout, no config received");
+        self->mqttPublishResponse("request_ble_config", "ok",
+                                  "\"message\":\"BLE config timeout, no changes\"");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "BLE config received: ssid='%s'", received_cfg.ssid.c_str());
+
+    // Save to NVS
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
+        if (!received_cfg.ssid.empty())
+            nvs_set_str(h, "ssid", received_cfg.ssid.c_str());
+        if (!received_cfg.pass.empty())
+            nvs_set_str(h, "pass", received_cfg.pass.c_str());
+        if (!received_cfg.ws_url.empty())
+            nvs_set_str(h, "ws_url", received_cfg.ws_url.c_str());
+        if (!received_cfg.mqtt_url.empty())
+            nvs_set_str(h, "mqtt_url", received_cfg.mqtt_url.c_str());
+        if (!received_cfg.mqtt_user.empty())
+            nvs_set_str(h, "user_id", received_cfg.mqtt_user.c_str());
+        if (!received_cfg.mqtt_pass.empty())
+            nvs_set_str(h, "tx_key", received_cfg.mqtt_pass.c_str());
+        if (!received_cfg.device_name.empty())
+            nvs_set_str(h, "device_name", received_cfg.device_name.c_str());
+        nvs_set_u8(h, "volume", received_cfg.volume);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    self->mqttPublishResponse("request_ble_config", "ok",
+                              "\"message\":\"BLE config saved, rebooting\"");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Reboot to apply new config (WiFi/MQTT/WS URLs may have changed)
+    esp_restart();
 }

@@ -24,7 +24,11 @@ static constexpr int SPI_NUM       = 2;   // SPI2
 static constexpr int UART_TX       = 7;   // C5 GPIO6  -> S3 GPIO17  (RX)
 static constexpr int UART_RX       = 6;   // C5 GPIO7  <- S3 GPIO18  (TX)
 
+// --- NVS Reset Button (hold LOW at boot to erase NVS) ---
+// Set to -1 to disable. Assign a real GPIO when hardware is ready.
+static constexpr int NVS_RESET_BTN = 9;
+
 // --- Free GPIOs ---
-// GPIO 9, 10 are available for future use
+// GPIO 10 is available for future use
 
 } // namespace PinConfig
