@@ -31,6 +31,7 @@ enum class ControlCmd : uint8_t {
     END            = 0x02,
     SET_VOLUME     = 0x03,
     REBOOT         = 0x04,
+    SET_BRIGHTNESS = 0x05,
     WIFI_CONFIG    = 0x10,
     MQTT_CONFIG    = 0x11,
     WS_CONFIG      = 0x12,

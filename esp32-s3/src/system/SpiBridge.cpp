@@ -185,9 +185,8 @@ void SpiBridge::pollLoop()
         bool c5_ready = (gpio_get_level(cfg_.pin_handshake) == 1);
 
         if (!has_tx && !c5_ready) {
-            // Nothing to do — yield to let IDLE task run
-            TickType_t delay_ticks = pdMS_TO_TICKS(5);
-            vTaskDelay(delay_ticks > 0 ? delay_ticks : 1);
+            // Minimum 1 tick delay (10ms at HZ=100); pdMS_TO_TICKS(2) = 0!
+            vTaskDelay(1);
             continue;
         }
 

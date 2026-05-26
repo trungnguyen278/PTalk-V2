@@ -147,13 +147,24 @@ void AppController::controllerTask(void* param)
     static_cast<AppController*>(param)->processQueue();
 }
 
+void AppController::sendStatusHeartbeat()
+{
+    if (!uart) return;
+    auto& sm = StateManager::instance();
+    uart->sendStatusUpdate(
+        (uint8_t)sm.getInteractionState(),
+        (uint8_t)sm.getConnectivityState(),
+        (uint8_t)sm.getSystemState(),
+        (uint8_t)sm.getEmotionState());
+}
+
 void AppController::processQueue()
 {
     ESP_LOGI(TAG, "Controller task started");
     AppMessage msg{};
 
     while (started.load()) {
-        if (xQueueReceive(app_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(app_queue, &msg, pdMS_TO_TICKS(3000)) == pdTRUE) {
             switch (msg.type) {
             case AppMessage::Type::INTERACTION:
                 onInteractionStateChanged(msg.interaction_state, msg.interaction_source);
@@ -175,6 +186,8 @@ void AppController::processQueue()
                 }
                 break;
             }
+        } else {
+            sendStatusHeartbeat();
         }
     }
 
@@ -219,4 +232,12 @@ void AppController::onConnectivityStateChanged(state::ConnectivityState s)
 void AppController::onSystemStateChanged(state::SystemState s)
 {
     ESP_LOGI(TAG, "System: %d", (int)s);
+
+    if (uart) {
+        uart->sendStatusUpdate(
+            (uint8_t)StateManager::instance().getInteractionState(),
+            (uint8_t)StateManager::instance().getConnectivityState(),
+            (uint8_t)s,
+            (uint8_t)StateManager::instance().getEmotionState());
+    }
 }

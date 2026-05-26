@@ -49,7 +49,7 @@ public:
     void stopAll();
     void stopListening();
     void startSpeaking();
-    void stopSpeaking();
+    void stopSpeaking(bool user_interrupt = false);
 
 private:
     void handleInteractionState(state::InteractionState s, state::InputSource src);

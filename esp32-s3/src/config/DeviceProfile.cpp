@@ -191,7 +191,7 @@ bool DeviceProfile::setup(AppController& app)
     spk_sd_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     spk_sd_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&spk_sd_cfg);
-    gpio_set_level((gpio_num_t)PinConfig::SPK_SD, 1);
+    gpio_set_level((gpio_num_t)PinConfig::SPK_SD, 0);
 
     gpio_config_t spk_gain_cfg = {};
     spk_gain_cfg.pin_bit_mask = (1ULL << PinConfig::SPK_GAIN);
@@ -199,7 +199,7 @@ bool DeviceProfile::setup(AppController& app)
     spk_gain_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     spk_gain_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&spk_gain_cfg);
-    ESP_LOGI(TAG, "MAX98357 SD=HIGH (enabled), GAIN=float (9dB)");
+    ESP_LOGI(TAG, "MAX98357 SD=LOW (muted until playback), GAIN=float (9dB)");
 
     // =========================================================
     // 4. I2S FULL-DUPLEX AUDIO (shared BCLK/WS for mic+speaker)
@@ -235,6 +235,7 @@ bool DeviceProfile::setup(AppController& app)
         .pin_bclk    = (gpio_num_t)PinConfig::I2S_BCLK,
         .pin_ws      = (gpio_num_t)PinConfig::I2S_WS,
         .pin_dout    = (gpio_num_t)PinConfig::I2S_DOUT,
+        .pin_sd      = (gpio_num_t)PinConfig::SPK_SD,
         .sample_rate = 48000
     };
     auto speaker = std::make_unique<I2SAudioOutput_MAX98357>(tx_chan, spk_cfg);
@@ -288,17 +289,43 @@ bool DeviceProfile::setup(AppController& app)
         auto interaction = sm.getInteractionState();
         if (interaction == state::InteractionState::LISTENING) return;
 
-        // Auto-trigger SPEAKING if audio arrives during PROCESSING/IDLE
-        if (interaction != state::InteractionState::SPEAKING) {
-            ESP_LOGI("SpiBridge", "Audio downlink auto-trigger SPEAKING (was %d)", (int)interaction);
+        // Auto-trigger SPEAKING only from PROCESSING (audio binary arrives before
+        // the SPEAKING text command). Do NOT auto-trigger from IDLE — stale SPI data
+        // arriving during stopSpeaking() drain would regress the state back to SPEAKING.
+        if (interaction == state::InteractionState::PROCESSING) {
+            ESP_LOGI("SpiBridge", "Audio downlink auto-trigger SPEAKING (was PROCESSING)");
             sm.setInteractionState(state::InteractionState::SPEAKING, state::InputSource::SERVER_COMMAND);
+        } else if (interaction != state::InteractionState::SPEAKING) {
+            return;
         }
 
-        // All-or-nothing: partial writes break [2B len][opus] stream alignment.
-        // Dropping a full SPI chunk is safe — Opus PLC handles gaps gracefully.
+        // All-or-nothing write to preserve [2B len][opus] stream alignment.
+        // Partial writes or dropped SPI chunks corrupt frame boundaries and
+        // cause cascading Opus decode errors. Wait for AudioRecv (Core 1)
+        // to drain enough space — SPI poll runs on Core 0, no deadlock risk.
         size_t space = xStreamBufferSpacesAvailable(spk_sb);
         if (space >= len) {
             xStreamBufferSend(spk_sb, data, len, 0);
+        } else {
+            TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(80);
+            bool wrote = false;
+            while (!wrote) {
+                TickType_t now = xTaskGetTickCount();
+                if (now >= deadline) break;
+                vTaskDelay(pdMS_TO_TICKS(2));
+                if (xStreamBufferSpacesAvailable(spk_sb) >= len) {
+                    xStreamBufferSend(spk_sb, data, len, 0);
+                    wrote = true;
+                }
+            }
+            if (!wrote) {
+                static uint32_t dl_drop_count = 0;
+                dl_drop_count++;
+                if (dl_drop_count <= 5 || dl_drop_count % 50 == 0) {
+                    ESP_LOGW("SpiBridge", "DL encoded buffer full after 80ms wait, dropped %zu bytes #%lu",
+                             len, (unsigned long)dl_drop_count);
+                }
+            }
         }
     });
 
@@ -321,17 +348,57 @@ bool DeviceProfile::setup(AppController& app)
                                     uint8_t system_state, uint8_t emotion) {
         auto& sm = StateManager::instance();
 
-        // C5 dictates the connectivity, system, and emotion states
         sm.setConnectivityState(static_cast<state::ConnectivityState>(connectivity));
         sm.setEmotionState(static_cast<state::EmotionState>(emotion));
-        sm.setSystemState(static_cast<state::SystemState>(system_state));
 
-        // Let C5 drive the interaction state as well (so Server can trigger SPEAKING)
+        // Forward system state from C5, but never revert S3 to BOOTING
+        // (S3 manages its own boot lifecycle independently)
+        auto new_sys = static_cast<state::SystemState>(system_state);
+        if (new_sys != state::SystemState::BOOTING) {
+            sm.setSystemState(new_sys);
+        }
+
+        // Let C5 drive the interaction state, but don't regress SPEAKING→PROCESSING.
+        // UART status carries C5's interaction state at the moment of the emotion change,
+        // which can be stale (e.g. emotion fires before SPEAKING command is processed).
         auto new_inter = static_cast<state::InteractionState>(interaction);
-        if (new_inter == state::InteractionState::PROCESSING || new_inter == state::InteractionState::SPEAKING) {
+        auto cur_inter = sm.getInteractionState();
+        if (new_inter == state::InteractionState::SPEAKING) {
+            if (cur_inter == state::InteractionState::PROCESSING ||
+                cur_inter == state::InteractionState::LISTENING ||
+                cur_inter == state::InteractionState::TRIGGERED) {
+                sm.setInteractionState(new_inter, state::InputSource::UNKNOWN);
+            }
+        } else if (new_inter == state::InteractionState::PROCESSING &&
+                   cur_inter != state::InteractionState::SPEAKING) {
             sm.setInteractionState(new_inter, state::InputSource::UNKNOWN);
-        } else if (new_inter == state::InteractionState::IDLE && sm.getInteractionState() == state::InteractionState::SPEAKING) {
+        } else if (new_inter == state::InteractionState::IDLE &&
+                   cur_inter == state::InteractionState::SPEAKING) {
             sm.setInteractionState(state::InteractionState::IDLE, state::InputSource::UNKNOWN);
+        }
+    });
+
+    // UART control commands: C5 forwards MQTT commands (volume, brightness) to S3
+    DisplayManager* disp_raw = display_mgr.get();
+    AudioManager* audio_raw = audio_mgr.get();
+    uart_bridge->onControlCmd([disp_raw, audio_raw](uart_proto::ControlCmd cmd,
+                                                      const uint8_t* data, size_t len) {
+        switch (cmd) {
+        case uart_proto::ControlCmd::SET_VOLUME:
+            if (len >= 1 && audio_raw) {
+                audio_raw->setVolume(data[0]);
+                ESP_LOGI("UartCtrl", "SET_VOLUME %d from C5", data[0]);
+            }
+            break;
+        case uart_proto::ControlCmd::SET_BRIGHTNESS:
+            if (len >= 1 && disp_raw) {
+                disp_raw->setBrightness(data[0]);
+                ESP_LOGI("UartCtrl", "SET_BRIGHTNESS %d from C5", data[0]);
+            }
+            break;
+        default:
+            ESP_LOGW("UartCtrl", "Unknown control cmd 0x%02X from C5", (int)cmd);
+            break;
         }
     });
 

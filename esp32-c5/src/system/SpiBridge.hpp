@@ -41,6 +41,9 @@ public:
     // Data must be a complete [2-byte LE len][opus data] frame.
     bool sendAudioDownlink(const uint8_t* data, size_t len);
 
+    // Clear downlink buffer and pull handshake LOW (call on session reset)
+    void resetDownlink();
+
     // Callback for audio uplink received from S3
     void onAudioUplink(AudioUplinkCb cb)  { audio_ul_cb_ = std::move(cb); }
 

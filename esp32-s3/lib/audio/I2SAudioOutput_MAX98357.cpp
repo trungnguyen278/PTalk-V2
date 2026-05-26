@@ -1,5 +1,6 @@
 #include "I2SAudioOutput_MAX98357.hpp"
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include <cstring>
 
@@ -62,6 +63,11 @@ bool I2SAudioOutput_MAX98357::startPlayback()
 
     prev_sample_ = 0;
     running_ = true;
+
+    if (cfg_.pin_sd != GPIO_NUM_NC) {
+        gpio_set_level(cfg_.pin_sd, 1);
+    }
+
     ESP_LOGI(TAG, "Playback started");
     return true;
 }
@@ -69,6 +75,11 @@ bool I2SAudioOutput_MAX98357::startPlayback()
 void I2SAudioOutput_MAX98357::stopPlayback()
 {
     if (!running_) return;
+
+    if (cfg_.pin_sd != GPIO_NUM_NC) {
+        gpio_set_level(cfg_.pin_sd, 0);
+    }
+
     running_ = false;
     ESP_LOGI(TAG, "Playback stopped");
 }
@@ -110,6 +121,17 @@ size_t I2SAudioOutput_MAX98357::writePcm(const int16_t* pcm, size_t pcm_samples)
 
     if (err != ESP_OK) return 0;
     return bytes_written / sizeof(int32_t);
+}
+
+void I2SAudioOutput_MAX98357::flushSilence()
+{
+    static int32_t silence[480] = {};
+    for (int i = 0; i < 6; i++) {
+        size_t written = 0;
+        if (i2s_channel_write(tx_chan_, silence, sizeof(silence),
+                              &written, pdMS_TO_TICKS(15)) != ESP_OK) break;
+        if (written == 0) break;
+    }
 }
 
 void I2SAudioOutput_MAX98357::setVolume(uint8_t percent)

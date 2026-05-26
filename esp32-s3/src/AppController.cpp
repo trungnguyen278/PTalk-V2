@@ -210,7 +210,7 @@ void AppController::processQueue()
                         break;
                     }
                     if (audio && StateManager::instance().getInteractionState() == state::InteractionState::SPEAKING) {
-                        audio->stopSpeaking();
+                        audio->stopSpeaking(true);
                     }
                     StateManager::instance().setInteractionState(
                         state::InteractionState::LISTENING, state::InputSource::BUTTON);

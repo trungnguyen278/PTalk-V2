@@ -14,6 +14,7 @@ public:
         gpio_num_t pin_bclk;    // Shared bit clock
         gpio_num_t pin_ws;      // Shared word select
         gpio_num_t pin_dout;    // Data out to amplifier
+        gpio_num_t pin_sd = GPIO_NUM_NC;  // Shutdown pin (LOW=mute, HIGH=active)
         uint32_t   sample_rate = 16000;
     };
 
@@ -27,6 +28,7 @@ public:
     bool   init();  // Init TX channel (call early for full-duplex clock)
     bool   startPlayback() override;
     void   stopPlayback() override;
+    void   flushSilence() override;
     size_t writePcm(const int16_t* pcm, size_t pcm_samples) override;
     void   setVolume(uint8_t percent) override;
     void   setLowPower(bool enable) override;

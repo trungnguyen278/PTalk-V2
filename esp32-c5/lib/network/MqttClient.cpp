@@ -138,8 +138,10 @@ bool MqttClient::publish(const std::string& topic,
                          int qos,
                          bool retain)
 {
-    if (!client_ || !connected_)
+    if (!client_ || !connected_) {
+        ESP_LOGW(TAG, "PUBLISH FAIL (not connected): topic=%s", topic.c_str());
         return false;
+    }
 
     int msg_id = esp_mqtt_client_publish(
         client_,
@@ -149,18 +151,33 @@ bool MqttClient::publish(const std::string& topic,
         qos,
         retain);
 
+    if (msg_id >= 0) {
+        ESP_LOGI(TAG, "PUBLISH OK: topic=%s msg_id=%d len=%d", topic.c_str(), msg_id, (int)json.size());
+        ESP_LOGI(TAG, "PUBLISH payload: %s", json.c_str());
+    } else {
+        ESP_LOGE(TAG, "PUBLISH FAIL: topic=%s err=%d", topic.c_str(), msg_id);
+    }
+
     return msg_id >= 0;
 }
 
 bool MqttClient::subscribe(const std::string& topic, int qos)
 {
-    if (!client_ || !connected_)
+    if (!client_ || !connected_) {
+        ESP_LOGW(TAG, "SUBSCRIBE FAIL (not connected): topic=%s", topic.c_str());
         return false;
+    }
 
     int msg_id = esp_mqtt_client_subscribe(
         client_,
         topic.c_str(),
         qos);
+
+    if (msg_id >= 0) {
+        ESP_LOGI(TAG, "SUBSCRIBE OK: topic=%s qos=%d msg_id=%d", topic.c_str(), qos, msg_id);
+    } else {
+        ESP_LOGE(TAG, "SUBSCRIBE FAIL: topic=%s err=%d", topic.c_str(), msg_id);
+    }
 
     return msg_id >= 0;
 }
@@ -205,20 +222,34 @@ void MqttClient::eventHandler(esp_mqtt_event_handle_t event)
     switch (event->event_id)
     {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT connected");
+        ESP_LOGI(TAG, "EVENT: CONNECTED session_present=%d", event->session_present);
         connected_ = true;
         if (connected_cb_)
             connected_cb_();
         break;
 
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "MQTT disconnected");
+        ESP_LOGW(TAG, "EVENT: DISCONNECTED");
         connected_ = false;
         if (disconnected_cb_)
             disconnected_cb_();
         break;
 
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "EVENT: SUBACK msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "EVENT: UNSUBACK msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "EVENT: PUBACK msg_id=%d", event->msg_id);
+        break;
+
     case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "EVENT: DATA topic_len=%d data_len=%d msg_id=%d",
+                 event->topic_len, event->data_len, event->msg_id);
         if (message_cb_)
         {
             std::string topic;
@@ -235,10 +266,17 @@ void MqttClient::eventHandler(esp_mqtt_event_handle_t event)
         break;
 
     case MQTT_EVENT_ERROR:
-        ESP_LOGE(TAG, "MQTT error");
+        ESP_LOGE(TAG, "EVENT: ERROR type=%d", event->error_handle->error_type);
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+            ESP_LOGE(TAG, "  esp_tls=%d tls_stack=%d transport_sock=%d",
+                     event->error_handle->esp_tls_last_esp_err,
+                     event->error_handle->esp_tls_stack_err,
+                     event->error_handle->esp_transport_sock_errno);
+        }
         break;
 
     default:
+        ESP_LOGD(TAG, "EVENT: id=%d", event->event_id);
         break;
     }
 }

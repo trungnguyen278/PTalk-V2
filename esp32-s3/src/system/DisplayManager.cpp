@@ -50,7 +50,7 @@ bool DisplayManager::init(std::unique_ptr<DisplayDriver> driver, int width, int 
     width_ = width;
     height_ = height;
 
-    drv->setRotation(1); // Landscape
+    drv->setRotation(3); // Landscape (rotated 180°)
     // Sync dimensions after rotation (driver swaps width↔height for landscape)
     width_ = drv->width();
     height_ = drv->height();
@@ -168,6 +168,10 @@ void DisplayManager::enableStateBinding(bool enable)
                                       { this->handleEmotion(s); });
 
     ESP_LOGI(TAG, "DisplayManager state binding enabled");
+
+    // Trigger initial state display — default states (BOOTING, OFFLINE) never
+    // fire callbacks because setXxxState() guards against same-value writes.
+    handleSystem(sm.getSystemState());
 }
 
 // (public show* helpers removed; UI is driven via handlers)
@@ -380,8 +384,7 @@ void DisplayManager::handleSystem(state::SystemState s)
         break;
 
     case state::SystemState::RUNNING:
-        // ESP_LOGI(TAG, "Displaying Running message");
-        playEmotion("idle");
+        handleConnectivity(StateManager::instance().getConnectivityState());
         break;
 
     case state::SystemState::ERROR:

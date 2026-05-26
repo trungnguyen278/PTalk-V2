@@ -20,7 +20,7 @@ bool UartBridge::init(const Config& cfg)
     uart_cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
     uart_cfg.source_clk = UART_SCLK_DEFAULT;
 
-    esp_err_t err = uart_driver_install(cfg_.uart_num, 512, 256, 0, nullptr, 0);
+    esp_err_t err = uart_driver_install(cfg_.uart_num, 1024, 256, 0, nullptr, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
         return false;
@@ -106,11 +106,16 @@ void UartBridge::rxLoop()
             if (type == (uint8_t)uart_proto::MsgType::STATUS_UPDATE &&
                 payload_len >= sizeof(uart_proto::StatusPayload)) {
                 auto* sp = reinterpret_cast<const uart_proto::StatusPayload*>(payload);
-                ESP_LOGI(TAG, "RX STATUS_UPDATE: int=%d conn=%d sys=%d emo=%d",
-                         sp->interaction, sp->connectivity, sp->system_state, sp->emotion);
                 if (status_cb_) {
                     status_cb_(sp->interaction, sp->connectivity,
                                sp->system_state, sp->emotion);
+                }
+            } else if (type == (uint8_t)uart_proto::MsgType::CONTROL_CMD &&
+                       payload_len >= 1) {
+                auto cmd = static_cast<uart_proto::ControlCmd>(payload[0]);
+                ESP_LOGI(TAG, "UART RX CONTROL_CMD: 0x%02X len=%d", payload[0], payload_len - 1);
+                if (ctrl_cb_) {
+                    ctrl_cb_(cmd, payload + 1, payload_len - 1);
                 }
             }
         }

@@ -16,7 +16,7 @@ public:
         gpio_num_t pin_tx;
         gpio_num_t pin_rx;
         uart_port_t uart_num = UART_NUM_1;
-        int baud_rate = 460800;
+        int baud_rate = 115200;
     };
 
     using ControlCmdCb = std::function<void(uart_proto::ControlCmd cmd,

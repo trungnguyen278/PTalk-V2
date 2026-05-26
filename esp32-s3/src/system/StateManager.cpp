@@ -14,47 +14,62 @@ StateManager& StateManager::instance()
 
 void StateManager::setInteractionState(state::InteractionState s, state::InputSource src)
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (s == interaction_state && src == interaction_source) return;
-    interaction_state = s;
-    interaction_source = src;
-    auto cbs = interaction_cbs;
+    decltype(interaction_cbs) cbs;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (s == interaction_state && src == interaction_source) return;
+        interaction_state = s;
+        interaction_source = src;
+        cbs = interaction_cbs;
+    }
     for (auto& [id, cb] : cbs) cb(s, src);
 }
 
 void StateManager::setConnectivityState(state::ConnectivityState s)
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (s == connectivity_state) return;
-    connectivity_state = s;
-    auto cbs = connectivity_cbs;
+    decltype(connectivity_cbs) cbs;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (s == connectivity_state) return;
+        connectivity_state = s;
+        cbs = connectivity_cbs;
+    }
     for (auto& [id, cb] : cbs) cb(s);
 }
 
 void StateManager::setSystemState(state::SystemState s)
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (s == system_state) return;
-    system_state = s;
-    auto cbs = system_cbs;
+    decltype(system_cbs) cbs;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (s == system_state) return;
+        system_state = s;
+        cbs = system_cbs;
+    }
     for (auto& [id, cb] : cbs) cb(s);
 }
 
 void StateManager::setPowerState(state::PowerState s)
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (s == power_state) return;
-    power_state = s;
-    auto cbs = power_cbs;
+    decltype(power_cbs) cbs;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (s == power_state) return;
+        power_state = s;
+        cbs = power_cbs;
+    }
     for (auto& [id, cb] : cbs) cb(s);
 }
 
 void StateManager::setEmotionState(state::EmotionState s)
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    if (s == emotion_state) return;
-    emotion_state = s;
-    auto cbs = emotion_cbs;
+    decltype(emotion_cbs) cbs;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (s == emotion_state) return;
+        emotion_state = s;
+        cbs = emotion_cbs;
+    }
     for (auto& [id, cb] : cbs) cb(s);
 }
 

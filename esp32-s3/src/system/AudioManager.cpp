@@ -48,12 +48,9 @@ bool AudioManager::init()
         return false;
     }
 
-    // S3 has PSRAM — use larger buffers than C5
-    // sb_mic_encoded is unused (MicStream sends directly to SPI, no intermediate buffer)
-    // Speaker encoded buffer is 16KB to absorb SPI jitter from C5 relay
     sb_mic_pcm     = xStreamBufferCreate(4 * 1024, 1);
-    sb_spk_pcm     = xStreamBufferCreate(8 * 1024, 1);
-    sb_spk_encoded = xStreamBufferCreate(16 * 1024, 1);
+    sb_spk_pcm     = xStreamBufferCreate(16 * 1024, 1);
+    sb_spk_encoded = xStreamBufferCreate(64 * 1024, 1);
 
     if (!sb_mic_pcm || !sb_spk_pcm || !sb_spk_encoded) {
         ESP_LOGE(TAG, "Failed to create stream buffers");
@@ -153,19 +150,22 @@ void AudioManager::startSpeaking()
     if (spk_play_task) xTaskNotifyGive(spk_play_task);
 }
 
-void AudioManager::stopSpeaking()
+void AudioManager::stopSpeaking(bool user_interrupt)
 {
     if (!speaking) return;
-    ESP_LOGI(TAG, "Stop speaking - draining buffers");
 
-    for (int i = 0; i < 250; ++i) {
-        size_t enc_bytes = sb_spk_encoded ? xStreamBufferBytesAvailable(sb_spk_encoded) : 0;
-        size_t pcm_bytes = sb_spk_pcm ? xStreamBufferBytesAvailable(sb_spk_pcm) : 0;
-        if (enc_bytes == 0 && pcm_bytes == 0) break;
-        if (i % 50 == 0) {
-            ESP_LOGI(TAG, "Draining: enc=%zu pcm=%zu bytes", enc_bytes, pcm_bytes);
+    if (user_interrupt) {
+        ESP_LOGI(TAG, "Stop speaking - user interrupt, immediate stop");
+    } else {
+        ESP_LOGI(TAG, "Stop speaking - draining PCM");
+        for (int i = 0; i < 15; ++i) {
+            size_t pcm_bytes = sb_spk_pcm ? xStreamBufferBytesAvailable(sb_spk_pcm) : 0;
+            if (pcm_bytes == 0) break;
+            if (i == 0) {
+                ESP_LOGI(TAG, "Draining PCM: %zu bytes", pcm_bytes);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     speaking = false;
@@ -276,11 +276,18 @@ void AudioManager::audioRecvLoop()
 
     const size_t pcm_frame = codec->pcmFrameSamples();
     constexpr size_t ENC_PREBUF = 2000;
-    uint8_t* frame_data = new uint8_t[1024];  // Server may send frames >500B at higher bitrates
+    constexpr int MAX_CONSECUTIVE_ERRORS = 3;
+    constexpr uint32_t STALE_TIMEOUT_MS = 5000;
+    constexpr uint32_t DRAIN_MS = 500;
+    uint8_t* frame_data = new uint8_t[1024];
     int16_t* pcm_out = new int16_t[pcm_frame];
     bool new_session = true;
     bool enc_prebuffered = false;
+    bool draining = false;
+    TickType_t drain_until = 0;
     uint32_t decode_count = 0;
+    int consecutive_errors = 0;
+    TickType_t last_decode_tick = 0;
 
     while (started) {
         if (!speaking) {
@@ -288,23 +295,49 @@ void AudioManager::audioRecvLoop()
             if (sb_spk_pcm) xStreamBufferReset(sb_spk_pcm);
             new_session = true;
             enc_prebuffered = false;
+            draining = false;
             decode_count = 0;
+            consecutive_errors = 0;
+            last_decode_tick = 0;
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
+        }
+
+        // Drain mode: discard all data arriving from C5 pipeline until timeout.
+        // After alignment breaks, C5's buffer (48KB) still contains shifted data.
+        // We must wait for it to flush through SPI before clean data arrives.
+        if (draining) {
+            if (xTaskGetTickCount() >= drain_until) {
+                draining = false;
+                xStreamBufferReset(sb_spk_encoded);
+                ESP_LOGI(TAG, "AudioRecv: drain complete");
+            } else {
+                uint8_t drain_buf[256];
+                xStreamBufferReceive(sb_spk_encoded, drain_buf, sizeof(drain_buf), pdMS_TO_TICKS(10));
+                continue;
+            }
         }
 
         if (!enc_prebuffered) {
             size_t enc_avail = xStreamBufferBytesAvailable(sb_spk_encoded);
             if (enc_avail < ENC_PREBUF) {
+                if (last_decode_tick > 0 &&
+                    (xTaskGetTickCount() - last_decode_tick) > pdMS_TO_TICKS(STALE_TIMEOUT_MS)) {
+                    ESP_LOGW(TAG, "AudioRecv: no data for %lums while speaking, forcing IDLE",
+                             (unsigned long)STALE_TIMEOUT_MS);
+                    StateManager::instance().setInteractionState(
+                        state::InteractionState::IDLE, state::InputSource::UNKNOWN);
+                }
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
             enc_prebuffered = true;
+            consecutive_errors = 0;
+            last_decode_tick = xTaskGetTickCount();
             ESP_LOGI(TAG, "AudioRecv: encoded pre-buffer ready (%zu bytes)", enc_avail);
         }
 
-        // Read 2-byte header. With raw byte streaming from SPI, header bytes
-        // may arrive across two SPI chunks, so accumulate with a loop.
+        // --- Read 2-byte header ---
         uint8_t header[2];
         size_t h_got = 0;
         TickType_t h_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(100);
@@ -315,22 +348,70 @@ void AudioManager::audioRecvLoop()
             if (r == 0) break;
             h_got += r;
         }
-        if (h_got < 2) continue;
-
-        uint16_t frame_len = header[0] | ((uint16_t)header[1] << 8);
-        if (frame_len == 0 || frame_len > 960) {
-            // Bad frame length — likely stream corruption. Skip this header pair.
-            ESP_LOGE(TAG, "AudioRecv: bad frame len %u, skipping", frame_len);
-            // Put header[1] back as potential start of next header by treating
-            // header[0] as junk. Read one more byte into header[0] and retry.
-            // Since stream buffer can't "unread", just skip this pair and
-            // hope the next 2 bytes form a valid header.
+        if (h_got < 2) {
+            if (xStreamBufferBytesAvailable(sb_spk_encoded) < ENC_PREBUF) {
+                enc_prebuffered = false;
+            }
             continue;
         }
 
-        // Read payload — loop until we get all bytes or timeout.
-        // With raw SPI streaming, payload may arrive across multiple SPI
-        // transactions (each delivering up to 250 bytes every few ms).
+        uint16_t frame_len = header[0] | ((uint16_t)header[1] << 8);
+        if (frame_len == 0 || frame_len > 512) {
+            consecutive_errors++;
+            ESP_LOGE(TAG, "AudioRecv: bad frame len %u (errors=%d)", frame_len, consecutive_errors);
+
+            if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+                ESP_LOGW(TAG, "AudioRecv: %d errors, draining pipeline for %lums",
+                         consecutive_errors, (unsigned long)DRAIN_MS);
+                xStreamBufferReset(sb_spk_encoded);
+                codec->reset();
+                draining = true;
+                drain_until = xTaskGetTickCount() + pdMS_TO_TICKS(DRAIN_MS);
+                enc_prebuffered = false;
+                new_session = true;
+                consecutive_errors = 0;
+                continue;
+            }
+
+            // Resync: scan byte-by-byte for a candidate header, then validate
+            // by attempting Opus decode. Only a successful decode confirms
+            // correct alignment — eliminates false positives from the old scan.
+            bool resynced = false;
+            for (int skip = 0; skip < 256 && !resynced; skip++) {
+                header[0] = header[1];
+                size_t r = xStreamBufferReceive(sb_spk_encoded, &header[1], 1, pdMS_TO_TICKS(5));
+                if (r == 0) break;
+                uint16_t candidate = header[0] | ((uint16_t)header[1] << 8);
+                if (candidate == 0 || candidate > 512) continue;
+
+                size_t trial_got = 0;
+                TickType_t trial_dl = xTaskGetTickCount() + pdMS_TO_TICKS(100);
+                while (trial_got < candidate) {
+                    TickType_t now = xTaskGetTickCount();
+                    if (now >= trial_dl) break;
+                    size_t r2 = xStreamBufferReceive(sb_spk_encoded, frame_data + trial_got,
+                                                      candidate - trial_got, trial_dl - now);
+                    if (r2 == 0) break;
+                    trial_got += r2;
+                }
+                if (trial_got < candidate) break;
+
+                codec->reset();
+                size_t trial_samples = codec->decode(frame_data, candidate, pcm_out, pcm_frame);
+                if (trial_samples > 0) {
+                    new_session = false;
+                    last_decode_tick = xTaskGetTickCount();
+                    resynced = true;
+                    ESP_LOGI(TAG, "AudioRecv: resynced after skipping %d bytes (decode OK, PCM discarded)", skip);
+                }
+            }
+            if (!resynced) {
+                ESP_LOGW(TAG, "AudioRecv: resync failed, will retry");
+            }
+            continue;
+        }
+
+        // --- Read frame payload ---
         size_t data_got = 0;
         TickType_t d_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(500);
         while (data_got < frame_len) {
@@ -342,9 +423,18 @@ void AudioManager::audioRecvLoop()
             data_got += r;
         }
         if (data_got < frame_len) {
-            // Incomplete frame — DON'T reset buffer! The remaining bytes are
-            // valid data for subsequent frames. Just discard this partial frame.
             ESP_LOGW(TAG, "AudioRecv: incomplete frame (%zu/%u), discarding", data_got, frame_len);
+            consecutive_errors++;
+            if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+                ESP_LOGW(TAG, "AudioRecv: too many incomplete, draining pipeline");
+                xStreamBufferReset(sb_spk_encoded);
+                codec->reset();
+                draining = true;
+                drain_until = xTaskGetTickCount() + pdMS_TO_TICKS(DRAIN_MS);
+                enc_prebuffered = false;
+                new_session = true;
+                consecutive_errors = 0;
+            }
             continue;
         }
 
@@ -354,12 +444,25 @@ void AudioManager::audioRecvLoop()
             ESP_LOGI(TAG, "New decode session started");
         }
 
+        // --- Decode ---
         size_t out_samples = codec->decode(frame_data, frame_len, pcm_out, pcm_frame);
         if (out_samples > 0) {
-            // Opus already handles frame continuity internally via its overlap-add
-            // windowing. The old quadratic crossfade was redundant and introduced
-            // artifacts (attenuating the first 80 samples of every frame).
             xStreamBufferSend(sb_spk_pcm, pcm_out, out_samples * sizeof(int16_t), pdMS_TO_TICKS(200));
+            consecutive_errors = 0;
+            last_decode_tick = xTaskGetTickCount();
+        } else {
+            consecutive_errors++;
+            if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+                ESP_LOGW(TAG, "AudioRecv: %d decode failures, draining pipeline", consecutive_errors);
+                xStreamBufferReset(sb_spk_encoded);
+                codec->reset();
+                draining = true;
+                drain_until = xTaskGetTickCount() + pdMS_TO_TICKS(DRAIN_MS);
+                enc_prebuffered = false;
+                new_session = true;
+                consecutive_errors = 0;
+                continue;
+            }
         }
 
         decode_count++;
@@ -390,6 +493,7 @@ void AudioManager::spkPlayLoop()
     while (started) {
         if (!speaking) {
             if (i2s_started) {
+                output->flushSilence();
                 output->stopPlayback();
                 i2s_started = false;
             }

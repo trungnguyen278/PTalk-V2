@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "AppController.hpp"
 #include "config/DeviceProfile.hpp"
+#include "system/StateManager.hpp"
 
 static const char* TAG = "MAIN";
 
@@ -23,4 +24,8 @@ extern "C" void app_main(void)
     }
 
     app.start();
+
+    StateManager::instance().setSystemState(state::SystemState::RUNNING);
+
+    ESP_LOGI(TAG, "ESP32-C5 startup complete");
 }

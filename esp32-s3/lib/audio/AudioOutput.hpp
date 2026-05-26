@@ -28,6 +28,9 @@ public:
     // Dừng phát
     virtual void stopPlayback() = 0;
 
+    // Flush DMA with silence (override in drivers that use DMA ring buffers)
+    virtual void flushSilence() {}
+
     // ========================================================================
     // Data write
     // ========================================================================

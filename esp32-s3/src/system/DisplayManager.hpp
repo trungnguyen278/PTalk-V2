@@ -67,13 +67,13 @@ public:
     bool startLoop(uint32_t interval_ms = 33,
                    UBaseType_t priority = 5,
                    uint32_t stackSize = 4096,
-                   BaseType_t core = tskNO_AFFINITY);
+                   BaseType_t core = 0);
     void stopLoop();
     bool isLoopRunning() const { return task_handle_ != nullptr; }
     void setUpdateIntervalMs(uint32_t interval_ms) { update_interval_ms_ = interval_ms; }
     
     // Aliases for consistency with other managers
-    bool start(uint32_t interval_ms = 33, UBaseType_t priority = 5, uint32_t stackSize = 4096, BaseType_t core = tskNO_AFFINITY) {
+    bool start(uint32_t interval_ms = 33, UBaseType_t priority = 5, uint32_t stackSize = 4096, BaseType_t core = 0) {
         return startLoop(interval_ms, priority, stackSize, core);
     }
     void stop() { stopLoop(); }

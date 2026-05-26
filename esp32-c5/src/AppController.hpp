@@ -52,6 +52,7 @@ private:
     void onInteractionStateChanged(state::InteractionState, state::InputSource);
     void onConnectivityStateChanged(state::ConnectivityState);
     void onSystemStateChanged(state::SystemState);
+    void sendStatusHeartbeat();
 
     int sub_inter_id = -1;
     int sub_conn_id  = -1;
