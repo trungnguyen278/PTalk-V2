@@ -277,11 +277,12 @@ function App() {
   );
 
   return (
-    <div className="app" data-screen-label="MOCHI-P Emotion Sheet">
+    <div className="app" data-screen-label="PTalk Emotion Sheet">
       <header className="hdr">
         <div className="hdr-name">
           <span className="logo">◉</span>
-          <span>Emotion Library</span>
+          <span>PTalk · Emotion Library</span>
+          <span className="hdr-version">v2.0</span>
         </div>
         <div className="hdr-meta">
           <span>{emotionKeys.length} emotions</span>

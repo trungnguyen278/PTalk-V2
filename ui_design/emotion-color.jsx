@@ -75,6 +75,8 @@ const EMOTION_TONE = {
 // scene tones — picked per scene category
 const SCENE_TONE = {
   weather:    'cyan',
+  boot:       'red',
+  network:    'cyan',
   clock:      'cyan',
   music:      'rose',
   timer:      'orange',
@@ -104,6 +106,20 @@ const SCENE_VARIANT_TONE = {
   'weather-cloudy':       'cyan',
   'weather-snow':         'white',
   'weather-storm':        'purple',
+
+  // boot: PTIT brand red across the whole sequence
+  'boot-poweron':         'red',
+  'boot-logo':            'red',
+  'boot-checks':          'red',
+  'boot-ready':           'red',
+
+  // network: cyan for in-progress, red for failures, purple for BLE
+  'network-wifi-scan':       'cyan',
+  'network-wifi-connect':    'cyan',
+  'network-wifi-retry':      'orange',
+  'network-offline':         'red',
+  'network-ble-pair':        'purple',
+  'network-server-error':    'red',
 
   // clock: alarm screams red, others stay cyan
   'clock-digital':        'cyan',

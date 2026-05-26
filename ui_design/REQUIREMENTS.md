@@ -1,7 +1,25 @@
-# Robot Emotion Library — Requirements (ptalk)
+# PTalk Robot Emotion Library v2.0 — Requirements
 
-Canonical spec for the screen-eye robot emotion library. Keep this in sync
-with the code. When porting to another project, **read this file first**.
+Canonical spec for the PTalk screen-eye robot emotion library. Keep this
+in sync with the code. When porting to another project, **read this file
+first**.
+
+Product: **PTalk v2.0** — a desktop companion robot built at PTIT
+(Posts and Telecommunications Institute of Technology).
+
+### What's new in v2.0
+
+| Area               | Change |
+| ------------------ | ------ |
+| Color              | TFT 9-tone curated palette (was mono cyan). Two-layer rule: face stays cyan, accessories take the category tone. See §4. |
+| Multi-color        | New `tone: 'multi'` for variants that need several colors at once (confetti, fireworks). |
+| Boot scene         | New `boot` scene category with 4 variants — PTIT-branded power-on sequence. See §6.5.1. |
+| Connectivity       | New `network` scene category with 6 variants covering the full wifi/BLE/server lifecycle. See §6.5.2. |
+| Emotion categories | 29 → 37 (added disgusted, nervous, embarrassed, curious, annoyed, cool, suspicious, determined). |
+| Total variants     | 117 → 227. |
+| Status bar         | Always rendered in fixed cyan (never tinted), regardless of active category. |
+
+---
 
 ---
 
@@ -13,8 +31,10 @@ expressive eyes — and, when context calls for it, **full-screen scenes**
 Implementation must be independently designed — do not copy proprietary
 frames, transitions, or distinctive marks from those products.
 
-**No brand text appears anywhere in the UI** (status bar, header, model line
-all neutral). Internal working code-name only.
+**No brand text appears inside the eye/scene SVG** (except the dedicated
+`boot` scene, which intentionally shows PTIT branding during power-on).
+The viewer chrome (HTML header, version badge) is allowed to identify
+the product as PTalk v2.0 — it's not part of the rendered display.
 
 Personality: friendly, slightly mischievous, expressive.
 
@@ -178,6 +198,112 @@ The viewer (`app.jsx`) implements this in the **"◉ Idle mode"** button.
 
 ---
 
+## 6.5 Boot & connectivity flow
+
+Firmware uses two `scene` categories — `boot` and `network` — to drive
+the entire startup-to-conversation pipeline. Both **block** the normal
+emotion loop while playing; the host should suspend autoplay until the
+flow exits.
+
+### 6.5.1 Cold boot sequence (happy path)
+
+```
+  POWER ON
+     ↓
+  boot-poweron       (2.4 s)  — single bright dot expands, splits
+                                into two eyes ("the robot wakes up")
+     ↓
+  boot-logo          (3.0 s)  — PTIT mark fades in with a sweep ring,
+                                subtitle "POSTS · TELECOMMUNICATIONS"
+     ↓
+  boot-checks        (4.2 s)  — self-test for DISPLAY / AUDIO / MIC /
+                                NETWORK / AI CORE, each row gets a
+                                spinner that flips to OK ✓
+     ↓
+  →→ [ enter connectivity sub-flow § 6.5.2 ] →→
+     ↓
+  boot-ready         (3.0 s)  — progress bar fills, "READY" stamp
+     ↓
+  HAND OFF to `normal` idle pool (§ 6)
+```
+
+Total happy-path duration is ~12.6 s of boot + however long the
+connectivity sub-flow takes.
+
+If a check **fails** during `boot-checks`, leave the failed row showing
+the spinner instead of OK for 1 s, then jump straight to the matching
+status scene:
+
+| Failed step | Jump to               |
+| ----------- | --------------------- |
+| DISPLAY     | (panic — firmware halts; no UI possible) |
+| AUDIO / MIC | continue boot, raise `error-warning` later (non-fatal) |
+| NETWORK     | enter § 6.5.2 immediately, skip `boot-ready` |
+| AI CORE     | `error-bang` then halt (model load failed) |
+
+### 6.5.2 Connectivity sub-flow (FSM)
+
+```
+           ┌── [ user holds the pair button ≥3 s ] ──┐
+           ↓                                          ↓
+     network-wifi-scan                          network-ble-pair
+      (search APs)                              (host serves BLE GATT;
+           ↓                                     waits for PTalk app to
+           ↓ stored SSID found                   push credentials → then
+           ↓                                     loop back to wifi-connect)
+     network-wifi-connect
+      (associate + DHCP)
+           ↓
+     ┌────┼───────┐
+  success   fail (1–3)
+     ↓        ↓
+     ↓   network-wifi-retry
+     ↓    (attempt N/3, orange)
+     ↓        ↓
+     ↓        → fail again → attempts < 3 → loop back to wifi-connect
+     ↓        → fail × 3       → network-offline (red)
+     ↓                                  ↓
+     ↓                                  → user can hold pair button → ble-pair
+     ↓                                  → or wait → retry every 60 s
+     ↓
+  ping ${PTALK_CLOUD}/health (3 s timeout)
+           ↓                            ↓
+      reachable                    unreachable
+           ↓                            ↓
+     EXIT to boot-ready          network-server-error (red, ERROR 503)
+                                       ↓
+                                       → backoff: 2 s, 5 s, 10 s, 30 s
+                                       → success → EXIT
+                                       → still failing → stay on this scene
+```
+
+### 6.5.3 Mid-session network loss
+
+While a conversation is running:
+
+1. **TCP / WebSocket drops** while talking to the cloud: pause the active
+   emotion (freeze on current frame, NOT idle pool), show
+   `network-server-error` for up to 5 s of fast retries (200 ms / 500 ms /
+   1 s / 2 s / 5 s exponential). On any successful reconnect, fade back
+   to the prior emotion. On 5 s timeout, drop into `network-offline`.
+2. **Wi-Fi link itself drops**: skip the server-error layer; go straight
+   to `network-offline`. Host stays on that scene until link returns,
+   then jumps to `network-wifi-connect` for the reassociation handshake.
+3. **Long offline (≥30 s)**: optionally play `error-noconn` emotion
+   variant once to acknowledge to the user (friendlier than holding the
+   `offline` status scene forever).
+
+### 6.5.4 Tone choices (recap)
+
+- `boot-*` — **red** across the sequence (PTIT brand identity layer)
+- `wifi-scan` / `wifi-connect` — **cyan** (neutral, in-progress)
+- `wifi-retry` — **orange** (caution; user should be aware but isn't fatal)
+- `offline` / `server-error` — **red** (failure)
+- `ble-pair` — **purple** (special mode; visually distinct from any normal
+  connect state so users don't confuse it with a hung wifi-connect)
+
+---
+
 ## 7. Categories at a glance
 
 ### Emotions (kind: 'emotion')
@@ -231,6 +357,8 @@ not an emotional reaction. Eyes are not drawn. Per-variant tones in `()`.
 
 | Category      | Variants | Purpose                                       |
 | ------------- | -------- | --------------------------------------------- |
+| `boot`        | 4        | **PTIT power-on sequence** (poweron → logo → checks → ready, all red) |
+| `network`     | 6        | **Connectivity status**: wifi-scan / wifi-connect / wifi-retry (orange) / offline (red) / ble-pair (purple) / server-error (red) |
 | `weather`     | 5        | Sunny (warm) / rainy (blue) / cloudy (cyan) / snow (white) / storm (purple) |
 | `clock`       | 3        | Digital (cyan), analog (cyan), alarm (red)    |
 | `music`       | 3        | Notes (rose), bars (cyan), wave (purple)      |
@@ -251,9 +379,9 @@ not an emotional reaction. Eyes are not drawn. Per-variant tones in `()`.
 | `gaming`      | 2        | Pad (purple), powerup (warm)                  |
 | `calendar`    | 2        | Date page (cyan), reminder (red)              |
 
-**Scene subtotal: 19 categories · 49 variants.**
+**Scene subtotal: 21 categories · 59 variants.**
 
-**Grand total: 56 categories · 217 variants.**
+**Grand total: 58 categories · 227 variants.**
 
 ✦ `listening` and `thinking` are **mandatory** — this is a conversational
 robot. Every dialog turn enters one of these two states.
@@ -411,6 +539,37 @@ Use these `id`s when calling from firmware. Listed in display order.
 
 ## 8b. Scene inventory
 
+### boot (4) — PTIT power-on sequence
+`boot-poweron` (red) · `boot-logo` (red) · `boot-checks` (red) · `boot-ready` (red)
+
+Firmware boot flow: play `boot-poweron` (2.4 s) → `boot-logo` (3 s) →
+`boot-checks` (4.2 s) → `boot-ready` (3 s) → hand off to `normal` idle pool.
+Logo + mark are an original geometric construction inspired by PTIT
+iconography — not a copy of the official school seal.
+
+### network (6) — connectivity status
+`network-wifi-scan` (cyan) · `network-wifi-connect` (cyan) ·
+`network-wifi-retry` (orange) · `network-offline` (red) ·
+`network-ble-pair` (purple) · `network-server-error` (red)
+
+Firmware connectivity FSM (suggested):
+```
+  poweron complete
+     ↓
+  network-wifi-scan  (no stored SSID)  →  network-ble-pair  (user holds button)
+     ↓ SSID known
+  network-wifi-connect
+     ↓ fail (3 attempts)         ↑ success
+  network-wifi-retry  →  network-offline
+     ↓ wifi up
+  (ping cloud)
+     ↓ reachable                  ↑ unreachable
+  hand off to emotions          network-server-error  (poll + retry)
+```
+While any `network-*` scene is playing the host should suppress
+user-facing emotions — these are blocking status displays.
+
+
 ### weather (5)
 `weather-sunny` (warm) · `weather-rainy` (blue) · `weather-cloudy` (cyan) ·
 `weather-snow` (white) · `weather-storm` (purple)
@@ -482,6 +641,8 @@ MOCHI-P Emotion Sheet.html   ← entry point (CSS, React loader)
 emotion-core.jsx             ← primitives, constants, EYE_TONES palette
 emotion-list.jsx             ← base emotion variants (29 cats from v1 spec)
 emotion-extras.jsx           ← additional variants + new categories
+scenes-boot.jsx              ← PTIT boot sequence (1 scene cat, 4 variants)
+scenes-network.jsx           ← Connectivity status (wifi/ble/server, 6 variants)
 emotion-balance.jsx          ← balance pass: brings every cat to ≥4 variants
 emotion-more.jsx             ← 8 brand-new emotion categories (disgusted,
                               nervous, embarrassed, curious, annoyed, cool,
@@ -502,10 +663,12 @@ REQUIREMENTS.md              ← this file
 4. scenes.jsx              ← tags emotion cats with kind:'emotion',
                               adds scene cats with kind:'scene'
 5. scenes-extras.jsx       ← adds 11 more scene categories
-6. emotion-balance.jsx     ← pushes balance variants onto existing cats
-7. emotion-more.jsx        ← adds 8 new emotion cats; inserts into KEYS
-8. emotion-color.jsx       ← assigns cat.tone + variant.tone
-9. app.jsx (or your host)  ← consumes
+6. scenes-boot.jsx         ← adds the PTIT boot scene
+7. scenes-network.jsx      ← adds the connectivity-status scene
+8. emotion-balance.jsx     ← pushes balance variants onto existing cats
+9. emotion-more.jsx        ← adds 8 new emotion cats; inserts into KEYS
+10. emotion-color.jsx      ← assigns cat.tone + variant.tone
+11. app.jsx (or your host) ← consumes
 ```
 
 All loaders mutate `window.EMOTION_CATEGORIES` and update
