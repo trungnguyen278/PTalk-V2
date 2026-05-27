@@ -12,6 +12,8 @@ set(app_includes
     ${CMAKE_SOURCE_DIR}/src/config
     ${CMAKE_SOURCE_DIR}/src/system
     ${CMAKE_SOURCE_DIR}/src/assets
+    ${CMAKE_SOURCE_DIR}/src/ui
+    ${CMAKE_SOURCE_DIR}/lib
     ${CMAKE_SOURCE_DIR}/lib/display
     ${CMAKE_SOURCE_DIR}/lib/power
     ${CMAKE_SOURCE_DIR}/lib/audio

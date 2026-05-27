@@ -10,6 +10,8 @@
 #include "StateTypes.hpp"
 #include "StateManager.hpp"
 #include "AnimationPlayer.hpp"
+#include "GfxEngine.hpp"
+#include "ui/SceneManager.hpp"
 
 // FreeRTOS (ESP32 task loop support)
 #include "freertos/FreeRTOS.h"
@@ -18,8 +20,8 @@
 
 // Forward declarations
 class DisplayDriver;       // ST7789 low-level driver
-// Framebuffer removed - direct rendering architecture
-class AnimationPlayer;     // Multi-frame animation engine
+class AnimationPlayer;     // Multi-frame animation engine (legacy 1-bit RLE)
+class GfxEngine;           // Procedural RGB565 rendering engine
 
 // ----------------------------------------------------------------------------
 // Asset descriptors
@@ -119,6 +121,13 @@ public:
     // Register an icon asset by name (copied into registry).
     void registerIcon(const std::string& name, const Icon& icon);
     
+    // --- Procedural rendering (GfxEngine) ---
+    // Play a procedural variant by category/variant ID
+    void playProcedural(const char* categoryKey, const char* variantId = nullptr);
+
+    // Access the scene manager for data injection
+    SceneManager* getSceneManager() { return &scene_mgr_; }
+
     // --- Asset Playback (for testing/direct control) ---
     // Play a named emotion animation at coordinates (default centers animation).
     void playEmotion(const std::string& name, int x = 0, int y = 0);
@@ -160,8 +169,12 @@ private:
 
 private:
     std::unique_ptr<DisplayDriver> drv; // owned low-level driver
-    // No Framebuffer - direct rendering to display!
-    std::unique_ptr<AnimationPlayer> anim_player;
+    std::unique_ptr<AnimationPlayer> anim_player; // legacy 1-bit RLE
+    std::unique_ptr<GfxEngine> gfx_;              // procedural RGB565
+    SceneManager scene_mgr_;
+
+    enum class RenderMode : uint8_t { LEGACY_RLE, PROCEDURAL };
+    RenderMode render_mode_ = RenderMode::LEGACY_RLE;
 
     // asset tables
     std::unordered_map<std::string, Animation1Bit> emotions;
