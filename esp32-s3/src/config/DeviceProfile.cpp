@@ -195,11 +195,12 @@ bool DeviceProfile::setup(AppController& app)
 
     gpio_config_t spk_gain_cfg = {};
     spk_gain_cfg.pin_bit_mask = (1ULL << PinConfig::SPK_GAIN);
-    spk_gain_cfg.mode = GPIO_MODE_INPUT;  // High-Z (floating) = 9dB
+    spk_gain_cfg.mode = GPIO_MODE_OUTPUT;  // Drive LOW (tied to GND) = 12dB
     spk_gain_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     spk_gain_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&spk_gain_cfg);
-    ESP_LOGI(TAG, "MAX98357 SD=LOW (muted until playback), GAIN=float (9dB)");
+    gpio_set_level((gpio_num_t)PinConfig::SPK_GAIN, 0);  // LOW = 12dB
+    ESP_LOGI(TAG, "MAX98357 SD=LOW (muted until playback), GAIN=LOW (12dB)");
 
     // =========================================================
     // 4. I2S FULL-DUPLEX AUDIO (shared BCLK/WS for mic+speaker)

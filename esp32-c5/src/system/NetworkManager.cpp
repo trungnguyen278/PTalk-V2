@@ -211,6 +211,10 @@ void NetworkManager::setupWebSocket()
 
 void NetworkManager::mqttPublishResponse(const char* cmd, const char* status, const char* extra_json)
 {
+    if (!mqtt_) {
+        ESP_LOGW(TAG, "MQTT TX skipped (client destroyed): cmd=%s status=%s", cmd, status);
+        return;
+    }
     std::string topic = "devices/" + std::string(getDeviceEfuseID()) + "/status";
     char buf[256];
     if (extra_json) {
@@ -536,15 +540,35 @@ void NetworkManager::bleConfigTaskEntry(void* arg)
 {
     auto* self = static_cast<NetworkManager*>(arg);
 
-    size_t free_heap = esp_get_free_heap_size();
-    ESP_LOGI(TAG, "BLE config task start, free heap: %lu", (unsigned long)free_heap);
+    // The "BLE config mode started" MQTT response was already published by
+    // the caller before this task was created. Give it time to flush.
+    vTaskDelay(pdMS_TO_TICKS(300));
 
-    if (free_heap < 60000) {
-        ESP_LOGW(TAG, "Not enough heap for BLE (%lu), aborting", (unsigned long)free_heap);
-        self->mqttPublishResponse("request_ble_config", "error",
-                                  "\"message\":\"insufficient memory for BLE\"");
+    // Tear down MQTT and WebSocket to free heap for BLE stack.
+    // WS tx_buffer alone is 48KB; together with MQTT they free ~65KB.
+    // Safe because BLE config always ends with esp_restart().
+    ESP_LOGI(TAG, "BLE config: releasing MQTT & WS to free heap (pre-cleanup: %lu)",
+             (unsigned long)esp_get_free_heap_size());
+
+    if (self->mqtt_) {
+        self->mqtt_->stop();
+        self->mqtt_.reset();
+    }
+    if (self->ws_) {
+        self->ws_->close();
+        self->ws_.reset();
+    }
+    self->ws_connected_ = false;
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    size_t free_heap = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "BLE config task start, free heap: %lu (after cleanup)", (unsigned long)free_heap);
+
+    if (free_heap < 50000) {
+        ESP_LOGW(TAG, "Still not enough heap for BLE (%lu), rebooting", (unsigned long)free_heap);
         self->ble_config_active_ = false;
-        vTaskDelete(nullptr);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
         return;
     }
 
@@ -593,13 +617,12 @@ void NetworkManager::bleConfigTaskEntry(void* arg)
     // Init BLE
     self->ble_ = new BluetoothService();
     if (!self->ble_->init("PTalk", networks, &current_cfg)) {
-        ESP_LOGE(TAG, "BLE init failed in config mode");
+        ESP_LOGE(TAG, "BLE init failed, rebooting to restore MQTT/WS");
         delete self->ble_;
         self->ble_ = nullptr;
         self->ble_config_active_ = false;
-        self->mqttPublishResponse("request_ble_config", "error",
-                                  "\"message\":\"BLE init failed\"");
-        vTaskDelete(nullptr);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
         return;
     }
 
@@ -628,10 +651,9 @@ void NetworkManager::bleConfigTaskEntry(void* arg)
     self->ble_config_active_ = false;
 
     if (!config_received) {
-        ESP_LOGW(TAG, "BLE config timeout, no config received");
-        self->mqttPublishResponse("request_ble_config", "ok",
-                                  "\"message\":\"BLE config timeout, no changes\"");
-        vTaskDelete(nullptr);
+        ESP_LOGW(TAG, "BLE config timeout, rebooting to restore MQTT/WS");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
         return;
     }
 
@@ -659,8 +681,7 @@ void NetworkManager::bleConfigTaskEntry(void* arg)
         nvs_close(h);
     }
 
-    self->mqttPublishResponse("request_ble_config", "ok",
-                              "\"message\":\"BLE config saved, rebooting\"");
+    ESP_LOGI(TAG, "BLE config saved, rebooting to apply");
     vTaskDelay(pdMS_TO_TICKS(500));
 
     // Reboot to apply new config (WiFi/MQTT/WS URLs may have changed)

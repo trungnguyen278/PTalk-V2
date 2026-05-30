@@ -122,6 +122,7 @@ void AudioManager::startListening(state::InputSource src)
     current_source = src;
     listening = true;
     speaking = false;
+    if (output) output->enableTxClock();
     input->startCapture();
 }
 
@@ -493,7 +494,7 @@ void AudioManager::spkPlayLoop()
     while (started) {
         if (!speaking) {
             if (i2s_started) {
-                output->flushSilence();
+                ESP_LOGI(TAG, "SpkPlay: speaking=false, stopping playback");
                 output->stopPlayback();
                 i2s_started = false;
             }

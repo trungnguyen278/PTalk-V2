@@ -29,6 +29,7 @@ public:
     bool   startPlayback() override;
     void   stopPlayback() override;
     void   flushSilence() override;
+    void   enableTxClock() override;
     size_t writePcm(const int16_t* pcm, size_t pcm_samples) override;
     void   setVolume(uint8_t percent) override;
     void   setLowPower(bool enable) override;
@@ -50,4 +51,5 @@ private:
     // Biquad LPF (reserved)
     BiquadState bq1_, bq2_;
     void resetFilter();
+    void ensureTxEnabled();
 };

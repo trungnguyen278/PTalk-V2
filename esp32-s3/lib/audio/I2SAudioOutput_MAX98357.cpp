@@ -64,24 +64,53 @@ bool I2SAudioOutput_MAX98357::startPlayback()
     prev_sample_ = 0;
     running_ = true;
 
+    esp_err_t dis_err = i2s_channel_disable(tx_chan_);
+    esp_err_t en_err  = i2s_channel_enable(tx_chan_);
+    ESP_LOGI(TAG, "startPlayback DMA reset: disable=%s enable=%s",
+             esp_err_to_name(dis_err), esp_err_to_name(en_err));
+
     if (cfg_.pin_sd != GPIO_NUM_NC) {
         gpio_set_level(cfg_.pin_sd, 1);
     }
 
-    ESP_LOGI(TAG, "Playback started");
+    ESP_LOGI(TAG, "Playback started (SD=HIGH)");
     return true;
 }
 
 void I2SAudioOutput_MAX98357::stopPlayback()
 {
     if (!running_) return;
+    running_ = false;
 
     if (cfg_.pin_sd != GPIO_NUM_NC) {
         gpio_set_level(cfg_.pin_sd, 0);
     }
 
-    running_ = false;
-    ESP_LOGI(TAG, "Playback stopped");
+    esp_err_t dis_err = i2s_channel_disable(tx_chan_);
+
+    // Preload silence so next enable (playback or mic clock) starts clean.
+    static int32_t silence[480] = {};
+    size_t total_loaded = 0;
+    for (int i = 0; i < 6; i++) {
+        size_t loaded = 0;
+        esp_err_t err = i2s_channel_preload_data(tx_chan_, silence,
+                                                  sizeof(silence), &loaded);
+        if (err != ESP_OK || loaded == 0) break;
+        total_loaded += loaded;
+    }
+
+    // Leave TX disabled — no clock to amp means no noise.
+    // enableTxClock() will re-enable when mic needs BCLK/WS.
+    ESP_LOGI(TAG, "stopPlayback: disable=%s preload=%zuB (TX stays off)",
+             esp_err_to_name(dis_err), total_loaded);
+}
+
+void I2SAudioOutput_MAX98357::enableTxClock()
+{
+    esp_err_t err = i2s_channel_enable(tx_chan_);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "TX enabled for mic clock");
+    }
 }
 
 size_t I2SAudioOutput_MAX98357::writePcm(const int16_t* pcm, size_t pcm_samples)
@@ -94,33 +123,37 @@ size_t I2SAudioOutput_MAX98357::writePcm(const int16_t* pcm, size_t pcm_samples)
     size_t count = (pcm_samples > 512) ? 512 : pcm_samples;
 
     for (size_t i = 0; i < count; ++i) {
-        // Use fixed-point multiply with rounding to reduce quantization noise.
-        // vol_scale = volume * 327 ≈ volume * 32768/100 (Q15 fraction)
         int32_t scaled = ((int32_t)pcm[i] * (int32_t)(volume_ * 327)) >> 15;
         out_buf[i] = scaled << 16;
-    }
-
-    // DEBUG: periodic status
-    static uint32_t write_count = 0;
-    write_count++;
-    if (write_count <= 3 || write_count % 2000 == 0) {
-        int16_t mn = pcm[0], mx = pcm[0];
-        for (size_t i = 1; i < count; ++i) {
-            if (pcm[i] < mn) mn = pcm[i];
-            if (pcm[i] > mx) mx = pcm[i];
-        }
-        ESP_LOGI(TAG, "writePcm[%lu] vol=%d cnt=%zu: min=%d max=%d",
-                 (unsigned long)write_count, (int)volume_, count,
-                 (int)mn, (int)mx);
     }
 
     size_t bytes_written = 0;
     esp_err_t err = i2s_channel_write(tx_chan_, out_buf,
                                        count * sizeof(int32_t),
                                        &bytes_written, pdMS_TO_TICKS(200));
+    if (err == ESP_ERR_INVALID_STATE) {
+        if (!running_) {
+            ESP_LOGW(TAG, "writePcm: channel disabled by stopPlayback, dropping %zu samples", count);
+            return 0;
+        }
+        ensureTxEnabled();
+        err = i2s_channel_write(tx_chan_, out_buf,
+                                 count * sizeof(int32_t),
+                                 &bytes_written, pdMS_TO_TICKS(200));
+    }
 
     if (err != ESP_OK) return 0;
     return bytes_written / sizeof(int32_t);
+}
+
+void I2SAudioOutput_MAX98357::ensureTxEnabled()
+{
+    // On ESP32-S3 full-duplex, disabling the RX channel can knock
+    // the TX channel out of RUNNING state.  Re-enable it if needed.
+    esp_err_t err = i2s_channel_enable(tx_chan_);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "TX channel was not running, re-enabled");
+    }
 }
 
 void I2SAudioOutput_MAX98357::flushSilence()
@@ -128,9 +161,14 @@ void I2SAudioOutput_MAX98357::flushSilence()
     static int32_t silence[480] = {};
     for (int i = 0; i < 6; i++) {
         size_t written = 0;
-        if (i2s_channel_write(tx_chan_, silence, sizeof(silence),
-                              &written, pdMS_TO_TICKS(15)) != ESP_OK) break;
-        if (written == 0) break;
+        esp_err_t err = i2s_channel_write(tx_chan_, silence, sizeof(silence),
+                                           &written, pdMS_TO_TICKS(15));
+        if (err == ESP_ERR_INVALID_STATE) {
+            ensureTxEnabled();
+            err = i2s_channel_write(tx_chan_, silence, sizeof(silence),
+                                     &written, pdMS_TO_TICKS(15));
+        }
+        if (err != ESP_OK || written == 0) break;
     }
 }
 

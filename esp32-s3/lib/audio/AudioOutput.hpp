@@ -31,6 +31,9 @@ public:
     // Flush DMA with silence (override in drivers that use DMA ring buffers)
     virtual void flushSilence() {}
 
+    // Enable TX clock for full-duplex mic sharing (no-op if not applicable)
+    virtual void enableTxClock() {}
+
     // ========================================================================
     // Data write
     // ========================================================================
