@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <cstring>
+#include <cmath>
 
 static const char *TAG = "AudioManager";
 
@@ -205,6 +206,17 @@ void AudioManager::micReadLoop()
         if (samples == 0) {
             vTaskDelay(1);
             continue;
+        }
+
+        // Khuếch đại âm thanh đầu vào lên x2 và dùng Soft Clipping (tanh)
+        // để làm mịn tín hiệu, tránh hiện tượng gấp khúc (hard clipping) gây rè
+        for (size_t i = 0; i < samples; i++) {
+            // Chuẩn hóa về dải [-1.0, 1.0] và nhân hệ số khuếch đại (2.0)
+            float x = (float)pcm_buf[i] * 2.0f / 32768.0f;
+            // Dùng hàm tanh để làm mịn (soft clip)
+            float y = std::tanh(x);
+            // Đưa trở lại dải int16_t
+            pcm_buf[i] = (int16_t)(y * 32767.0f);
         }
 
         read_count++;
