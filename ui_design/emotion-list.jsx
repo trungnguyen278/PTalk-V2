@@ -1,3 +1,14 @@
+/**
+ * File:    emotion-list.jsx
+ * Author:  Trung Nguyen
+ * GitHub:  https://github.com/trungnguyen278/PTalk-V2
+ * Date:    30 Jun 2026
+ *
+ * Description:
+ *  - Part of the PTalk-V2 project
+ *  - Written and maintained by Trung Nguyen
+ */
+
 /* MOCHI-P emotion library — categories × variants.
    Depends on emotion-core.jsx (loaded first → window.EmotionCore).
    Exposes window.EMOTION_CATEGORIES (ordered map).

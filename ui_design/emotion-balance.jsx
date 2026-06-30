@@ -1,3 +1,14 @@
+/**
+ * File:    emotion-balance.jsx
+ * Author:  Trung Nguyen
+ * GitHub:  https://github.com/trungnguyen278/PTalk-V2
+ * Date:    30 Jun 2026
+ *
+ * Description:
+ *  - Part of the PTalk-V2 project
+ *  - Written and maintained by Trung Nguyen
+ */
+
 /* MOCHI-P Emotion library — BALANCE pass
    Adds extra variants to under-represented categories so every category
    has at least 4 variants. Loaded AFTER emotion-extras.jsx (and after

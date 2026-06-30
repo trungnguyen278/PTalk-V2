@@ -1,4 +1,16 @@
 #pragma once
+
+/**
+ * File:    TouchInput.hpp
+ * Author:  Trung Nguyen
+ * GitHub:  https://github.com/trungnguyen278/PTalk-V2
+ * Date:    30 Jun 2026
+ *
+ * Description:
+ *  - Part of the PTalk-V2 project
+ *  - Written and maintained by Trung Nguyen
+ */
+
 #include <cstdint>
 #include <functional>
 #include <atomic>
@@ -7,19 +19,6 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 
-/**
- * Class:   TouchInput
- * Author:  Trung Nguyen
- * Email:   Trung.nt202717@gmail.com
- * Date:    17 Dec 2025
- *
- * Description:
- *  - Đọc trạng thái cảm ứng / nút bấm từ một chân GPIO
- *  - Hỗ trợ debounce, phát hiện nhấn dài
- *  - Gọi callback khi có sự kiện
- *  - Chạy trong task riêng để không block main thread
- *  - Cấu hình đơn giản qua struct Config
- */
 class TouchInput
 {
 public:

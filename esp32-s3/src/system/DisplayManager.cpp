@@ -1,3 +1,14 @@
+/**
+ * File:    DisplayManager.cpp
+ * Author:  Trung Nguyen
+ * GitHub:  https://github.com/trungnguyen278/PTalk-V2
+ * Date:    30 Jun 2026
+ *
+ * Description:
+ *  - Part of the PTalk-V2 project
+ *  - Written and maintained by Trung Nguyen
+ */
+
 #include "DisplayManager.hpp"
 #include "DisplayDriver.hpp"
 // Framebuffer.hpp removed - using direct rendering
@@ -50,7 +61,7 @@ bool DisplayManager::init(std::unique_ptr<DisplayDriver> driver, int width, int 
     width_ = width;
     height_ = height;
 
-    drv->setRotation(3); // Landscape (rotated 180°)
+    drv->setRotation(1); // Landscape (rotated 180°)
     // Sync dimensions after rotation (driver swaps width↔height for landscape)
     width_ = drv->width();
     height_ = drv->height();

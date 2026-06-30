@@ -1,3 +1,12 @@
+# File:    convert_gif.py
+# Author:  Trung Nguyen
+# GitHub:  https://github.com/trungnguyen278/PTalk-V2
+# Date:    30 Jun 2026
+#
+# Description:
+#  - Part of the PTalk-V2 project
+#  - Written and maintained by Trung Nguyen
+
 def to_2bit(img: Image.Image) -> List[int]:
     """Convert grayscale image to 2-bit per pixel (4 levels: 0-3)."""
     pixels = list(img.getdata())

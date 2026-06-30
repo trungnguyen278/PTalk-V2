@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# File:    convert_assets.py
+# Author:  Trung Nguyen
+# GitHub:  https://github.com/trungnguyen278/PTalk-V2
+# Date:    30 Jun 2026
+#
+# Description:
+#  - Part of the PTalk-V2 project
+#  - Written and maintained by Trung Nguyen
+
 import os
 import argparse
 from typing import List, Optional, Tuple

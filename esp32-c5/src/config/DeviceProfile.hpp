@@ -1,15 +1,14 @@
 #pragma once
 
 /**
- * Class:   DeviceProfile
+ * File:    DeviceProfile.hpp
  * Author:  Trung Nguyen
- * Email:
- * Date:    17 Dec 2025
- * 
+ * GitHub:  https://github.com/trungnguyen278/PTalk-V2
+ * Date:    30 Jun 2026
+ *
  * Description:
- *  - Cấu hình thiết bị cụ thể trước khi khởi động ứng dụng
- *  - Thiết lập các tham số phần cứng, khởi tạo module
- *  - Được gọi từ AppController trước khi start()
+ *  - Part of the PTalk-V2 project
+ *  - Written and maintained by Trung Nguyen
  */
 
 class AppController;

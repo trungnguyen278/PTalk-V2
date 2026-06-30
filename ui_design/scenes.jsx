@@ -1,3 +1,14 @@
+/**
+ * File:    scenes.jsx
+ * Author:  Trung Nguyen
+ * GitHub:  https://github.com/trungnguyen278/PTalk-V2
+ * Date:    30 Jun 2026
+ *
+ * Description:
+ *  - Part of the PTalk-V2 project
+ *  - Written and maintained by Trung Nguyen
+ */
+
 /* Scenes — contextual full-screen content, not just eyes.
    Inspired by Dasai-Mochi-style videos where the screen shows weather,
    clocks, music, etc. depending on context.
